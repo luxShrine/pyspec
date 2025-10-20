@@ -1,6 +1,6 @@
 site_name: pyspectral
 # 
-repo_url: https://github.com/luxshrine/pyspectral/
+repo_url: https://github.com/luxshrine/pyspec/
 #
 theme:
   name: readthedocs
