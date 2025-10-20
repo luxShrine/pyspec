@@ -1,0 +1,9 @@
+site_name: pyspectral
+# 
+repo_url: https://github.com/luxshrine/pyspectral/
+#
+theme:
+  name: readthedocs
+#
+extra:
+  version: 0.1

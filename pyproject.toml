@@ -1,0 +1,101 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "pyspectral"
+version = "0.0.1"
+description = "Machine learning for processing spectral imaging"
+authors = [
+  { name = "" },
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License"
+]
+dependencies = [
+    "loguru",
+    "matplotlib>=3.10.6",
+    "mkdocs",
+    "numpy>=2.3.2",
+    "polars>=1.33.0",
+    "python-dotenv",
+    "scikit-image>=0.25.2",
+    "scikit-learn>=1.7.1",
+    "torch>=2.8.0",
+    "torchsummary>=1.5.1",
+    "torchvision>=0.23.0",
+    "tqdm",
+]
+requires-python = "~=3.13.0"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "ipykernel>=6.30.1",
+]
+
+[tool.ruff]
+line-length = 88
+src = ["pyspectral"]
+include = ["pyproject.toml", "pyspectral/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["pyspectral"]
+force-sort-within-sections = true
+
+# type linting settings
+[tool.mypy]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+check_untyped_defs = false
+disallow_untyped_defs = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["matplotlib.*", "torch.*", "sklearn.*"]
+ignore_missing_imports = true
+
+[tool.zuban]
+strict = true
+disallow_untyped_defs = true
+warn_unreachable = true
+
+[tool.basedpyright]
+include = ["pyspectal"]
+exclude = ["**/__pycache__"]
+defineConstant = { DEBUG = true }
+pythonVersion = "3.13"
+disableOrganizeImports = true
+diagnosticMode = "openFilesOnly"
+autoSearchPaths = true
+pythonPlatform = "Windows"
+
+autoImportCompletions = true
+useLibraryCodeForTypes = true
+reportAny = false
+reportMissingTypeArgument = false
+reportMissingTypeStubs = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportUnusedCallResult = false
+reportUnusedImport = "none"
+reportMissingImports = "error"
+reportUnusedVariable = "hint" 
+
+[tool.basedpyright.inlayHints]
+variableTypes = true
+callArgumentNames = true
+functionReturnTypes = true
+genericTypes = true 
