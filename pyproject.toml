@@ -79,7 +79,6 @@ disableOrganizeImports = true
 diagnosticMode = "openFilesOnly"
 autoSearchPaths = true
 pythonPlatform = "Windows"
-
 autoImportCompletions = true
 useLibraryCodeForTypes = true
 reportAny = false

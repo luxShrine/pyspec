@@ -189,3 +189,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# LabSpec viewer exports
+*.vid
+*.avi

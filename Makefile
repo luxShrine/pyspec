@@ -43,7 +43,7 @@ type:
 ## Run tests
 .PHONY: test
 test:
-	python -m pytest tests
+	uv run pytest tests
 
 
 ## Set up Python interpreter environment
