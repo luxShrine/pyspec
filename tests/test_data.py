@@ -17,7 +17,12 @@ hsi_raw = pyf.HSIMap.load(raw_first, acq_time_s=10.0, accumulation=2)
 hsi_prc = pyf.HSIMap.load(prc_first, acq_time_s=10.0, accumulation=2)
 
 wl, xy, spectra, cube = (hsi_raw.wl, hsi_raw.xy, hsi_raw.spectra, hsi_raw.cube)
-wl_gt, xy_gt, spectra_gt, cube_gt = (hsi_prc.wl, hsi_prc.xy, hsi_prc.spectra, hsi_prc.cube)
+wl_gt, xy_gt, spectra_gt, cube_gt = (
+    hsi_prc.wl,
+    hsi_prc.xy,
+    hsi_prc.spectra,
+    hsi_prc.cube,
+)
 
 # TODO: grab this value instead of hardcoding it
 M = 950
@@ -39,7 +44,7 @@ def test_spectral_pair():
     pair = pyd.SpectraPair(spectra.get(), spectra_gt.get())
     ncomp = max(2, min(pair.X_raw.shape[0] // 2, 32))
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
-    pred = pair._pcr_predict(cv)
+    pred = pair.pcr_predict(cv)
 
     assert isinstance(pred, npt.ArrayLike)
 
