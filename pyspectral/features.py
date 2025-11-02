@@ -3,15 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 from pathlib import Path
+from typing import NewType
 
 from loguru import logger
 import numpy as np
+from scipy import sparse
 from scipy.signal import find_peaks, medfilt, savgol_filter
+from scipy.sparse.linalg import spsolve
 
 from pyspectral.config import ArrayF, ArrayF32, Cube, FlatMap, MeanArray, StdArray
 
 ALGINATE_PEAK_CM = 1003.0  # 1,410 cm^-1 peaks, other potentials: 3250, 2940, 1600, 1020
-type PeakNormMode = GuidedPeakNorm | NonePeakNorm | FixedPeakNorm
 
 
 class SpectralMode(StrEnum):
@@ -239,8 +241,11 @@ def resample_cube(cube: Cube, wl_src: ArrayF, wl_dst: ArrayF) -> Cube:
     )
 
 
-def _median_spike_removal(y: FlatMap, k: int) -> ArrayF32:
+def _median_spike_removal(y: FlatMap, k: int | None) -> ArrayF32:
     """Apply 1D median filter of window k to each spectrum (rows of y)."""
+    if k is None:
+        logger.debug("No median spike removal pre-processing done.")
+        return y
     if k % 2 == 0:
         k += 1
         logger.warning(f"Adjusted kernel size to be odd: {k=}")
@@ -250,8 +255,11 @@ def _median_spike_removal(y: FlatMap, k: int) -> ArrayF32:
     return out
 
 
-def _poly_baseline_subtract(y: ArrayF32, wl: ArrayF, degree: int) -> ArrayF32:
+def _poly_baseline_subtract(y: ArrayF32, wl: ArrayF, degree: int | None) -> ArrayF32:
     """Fit polynomial baseline per spectrum; subtract it."""
+    if degree is None:
+        logger.debug("No baseline subtraction done.")
+        return y
     x = wl.astype(np.float64)
     out = np.empty_like(y)
     V = np.vander(x, N=degree + 1, increasing=False)  # (M, deg+1)
@@ -344,31 +352,195 @@ class SmoothCfg:
                 f"Smooth polynomial value must be within range of (1-10), found {self.poly=}"
             )
 
+    def smooth(self, y) -> ArrayF32:
+        return savgol_filter(
+            y, window_length=self.window, polyorder=self.poly, axis=1
+        ).astype(np.float32)
+
+
+BaselinePolynomialDegree = NewType("BaselinePolynomialDegree", int)
+
+
+@dataclass
+class ALS:
+    """
+    Parameters:
+    lam : float
+        Smoothness (λ). Larger => smoother baseline. Typical Raman 1e5–1e7.
+    p : float
+        Asymmetry. Small p (~0.001–0.05) downweights positive residuals, typically peaks.
+    niter : int
+        Max iterations of reweighting.
+    tol : float
+        Relative change tolerance for early stop.
+    """
+
+    smoothness: float = 1e5
+    asymmetry: float = 0.01
+    n_iter: int = 20
+    tolerance: float = 1e-4
+
+    def remove_baseline(
+        self,
+        y: np.ndarray,
+    ) -> tuple[np.ndarray, FlatMap]:
+        """
+        Robust baseline via asymmetric least squares (ALS).
+
+        Args:
+        y : array
+            1D spectrum (C,) or 2D array (N, C). Baseline is computed along `axis`.
+
+        Returns:
+        baseline : array
+            Estimated baseline, same shape as `y`.
+        corrected : array
+            y - baseline
+
+        Notes:
+        Solves for z: argmin_z  (sum_i^C w_i (y_i - z_i)^2 + λ ||D^2 z||^2_2) ,
+        with asymmetric weights w_i updated as:
+            w_i = p   if (y_i - z_i) > 0  (peak region)
+                = 1-p otherwise           (baseline region)
+
+        # References
+        Inspired by https://github.com/charlesll/Spectra.jl/blob/master/src/baseline.jl
+
+        """
+        # Percentile for mask. Values above this are considered peaks.
+        MASK_PERCENTILE: float = 95.0
+        # Dilate the mask by this many points on each side.
+        MASK_HALF_WIDTH: int = 6
+        axis: int = -1  # Spectral axis.
+        p = self.asymmetry
+        lam = self.smoothness
+
+        y = np.asarray(y)
+        y = np.moveaxis(y, axis, -1)  # operate on last axis
+        orig_shape = y.shape
+        C = y.shape[-1]
+        Y = y.reshape(-1, C)  # (M, C) where M = prod(other dims)
+
+        # Build second-difference operator (D^2), a second derivative to act on z
+        # d_op acts as a penalty to non-smooth curves, these high slope regions
+        # are likely to be peaks, not a part of the baseline
+        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")
+        dt_d = (d_op.T @ d_op).tocsc()
+
+        # Construct peak mask (shared across rows)
+        threshold = np.nanpercentile(Y, MASK_PERCENTILE, axis=-1, keepdims=True)
+        mask = (Y > threshold).astype(int)
+        kernel = np.ones(2 * MASK_HALF_WIDTH + 1, dtype=int)
+        # apply: (a * v)_n = \sum_{m = -\infty}^{\infty} a_m v_{n - m} to the rows
+        # The convolution finds the overlap between the kernel and the mask of the signal
+        mask = np.apply_along_axis(
+            lambda a: np.convolve(a=a, v=kernel, mode="same"), -1, mask
+        )
+        # only keep the matches
+        mask_positive = mask > 0
+        peak_mask_batch = mask_positive.astype(bool)
+
+        # Iterate per-row, finding the penalized least square for some z with
+        # the current weight w
+        Z = np.zeros_like(Y)
+        for i in range(Y.shape[0]):
+            yi = Y[i]
+            wi = np.ones(C, dtype=float)  # reset every loop
+
+            # Downweight on peak regions, using mask
+            p_local = np.full(C, p, dtype=float)
+            DOWN_FACTOR = 0.1
+            p_local[peak_mask_batch[i]] = min(p * DOWN_FACTOR, 0.0005)
+
+            zi_prev = None
+            for it in range(self.n_iter):
+                # Construct A = W + λ D^T D, and solve for z in Az = Wy
+                W = sparse.diags(wi, 0, shape=(C, C), format="csc")
+                A = W + (lam * dt_d)
+                b = wi * yi  # W y
+                zi = spsolve(A, b)
+
+                # check for convergence
+                if zi_prev is not None:
+                    denom = max(np.linalg.norm(zi_prev), 1e-12)
+                    if (np.linalg.norm(zi - zi_prev) / denom) < self.tolerance:
+                        break
+                # if not, continue on iterating
+                zi_prev = zi
+                # Update asymmetric weights
+                residual = yi - zi
+                positive_resid = residual > 0
+                # determine if in peak region: p_local, else: 1 - p_local
+                wi = np.where(positive_resid, p_local, 1.0 - p_local)
+                # Prevent weights being zero
+                wi = np.clip(wi, 1e-6, 1.0)
+
+            Z[i] = zi
+
+        baseline = Z.reshape(orig_shape)
+        baseline = np.moveaxis(baseline, -1, axis)
+        corrected = np.moveaxis(y.reshape(orig_shape), -1, axis) - baseline
+        return baseline, FlatMap.make(corrected)
+
+
+type BaselineMethod = BaselinePolynomialDegree | ALS | None
+
 
 @dataclass
 class PreConfig:
     smoothing: SmoothCfg | None = None
     mode: SpectralMode = SpectralMode.RAMAN
-    spike_kernel_size: int = 7
-    baseline_poly: int = 2
+    spike_kernel_size: int | None = 7
+    baseline: BaselineMethod = 2
 
     def __post_init__(self) -> None:
         if self.smoothing and ((w := self.smoothing.window) % 2 == 0):
             self.smoothing = replace(self.smoothing, window=(w + 1))
-        if self.baseline_poly < 1 or self.baseline_poly >= 10:
+        if isinstance(self.baseline, int) and (
+            self.baseline < 1 or self.baseline >= 10
+        ):
             raise RuntimeError(
-                f"Baseline polynomial variable must be within range of (1-10), found {self.baseline_poly=}"
+                f"Baseline polynomial variable must be within range of (1-10), found {self.baseline=}"
             )
-        if self.spike_kernel_size < 1 or self.spike_kernel_size >= 20:
+        if self.spike_kernel_size and (
+            self.spike_kernel_size < 1 or self.spike_kernel_size >= 20
+        ):
             raise RuntimeError(
                 f"Spike kernel variable must be within range of (1-20), found {self.spike_kernel_size=}"
             )
 
     @classmethod
-    def make(
+    def make_min(cls, mode: SpectralMode = SpectralMode.RAMAN) -> PreConfig:
+        """Provide a minimal pre-processing config."""
+        return cls(None, mode, None, None)
+
+    @classmethod
+    def make_als(
+        cls,
+        mode: SpectralMode = SpectralMode.RAMAN,
+        smoothness: float = 1e5,
+        asymmetry: float = 0.01,
+        n_iter: int = 20,
+        tolerance: float = 1e-4,
+    ) -> PreConfig:
+        """Provide a minimal pre-processing config."""
+        return cls(
+            None,
+            mode,
+            ALS(
+                smoothness=smoothness,
+                asymmetry=asymmetry,
+                n_iter=n_iter,
+                tolerance=tolerance,
+            ),
+            None,
+        )
+
+    @classmethod
+    def make_poly(
         cls,
         spike_kernel_size: int | None,
-        baseline_poly: int | None,
+        baseline_poly: BaselinePolynomialDegree | None,
         s_poly: int | None = None,
         s_window: int | None = None,
     ) -> PreConfig:
@@ -384,18 +556,15 @@ class PreConfig:
         else:
             smooth_cfg = None
 
-        if spike_kernel_size is not None and baseline_poly is not None:
-            return cls(
-                spike_kernel_size=spike_kernel_size,
-                baseline_poly=baseline_poly,
-                smoothing=smooth_cfg,
-            )
-        elif baseline_poly is not None:
-            return cls(baseline_poly=baseline_poly, smoothing=smooth_cfg)
-        elif spike_kernel_size is not None:
-            return cls(spike_kernel_size=spike_kernel_size, smoothing=smooth_cfg)
+        if smooth_cfg is None and spike_kernel_size is None and baseline_poly is None:
+            return cls.make_min()
         else:
-            return cls(smoothing=smooth_cfg)
+            return cls(
+                smoothing=smooth_cfg,
+                mode=SpectralMode.RAMAN,
+                spike_kernel_size=spike_kernel_size,
+                baseline=baseline_poly,
+            )
 
 
 @dataclass(frozen=True)
@@ -410,9 +579,27 @@ class NonePeakNorm:
 
 
 @dataclass(frozen=True)
+class GlobalPeakNorm:
+    mode_type: str = "Global"
+
+    @staticmethod
+    def normalize(
+        y: ArrayF32,
+    ) -> ArrayF32:
+        """Preform a global normalization."""
+        min = np.min(y)
+        num = y - min
+        den = np.max(y) - min
+        return num / den
+
+
+@dataclass(frozen=True)
 class FixedPeakNorm:
     center_cm1: float
     mode_type: str = "Fixed"
+
+
+type PeakNormMode = GuidedPeakNorm | NonePeakNorm | FixedPeakNorm | GlobalPeakNorm
 
 
 @dataclass(frozen=True)
@@ -425,6 +612,11 @@ class PreprocStats:
             raise RuntimeError("Cannot get center of preprocess stats as it is none")
         else:
             return self.ref_center_cm1
+
+
+type NormResult = tuple[
+    ArrayF32, PreprocStats | None, int | float | None, int | float | None
+]
 
 
 @dataclass(frozen=True)
@@ -447,8 +639,36 @@ class PeakNormConfig:
                 return PreprocStats(center, self.halfwidth_cm1)
             case FixedPeakNorm():
                 return PreprocStats(self.mode.center_cm1, self.halfwidth_cm1)
-            case NonePeakNorm():
+            case _:
                 return PreprocStats(None, None)
+
+    def normalize(
+        self, cube_maybe: Cube | CubeStats, y: ArrayF, wl_cm1: ArrayF
+    ) -> NormResult:
+        ref_center = None
+        ref_halfw = None
+        stats = None
+        if isinstance(self.mode, GlobalPeakNorm):
+            stats = self.fit_preproc(y, wl_cm1)
+            return GlobalPeakNorm.normalize(y), stats, ref_center, ref_halfw
+        elif not isinstance(self.mode, NonePeakNorm):
+            if isinstance(cube_maybe, Cube):
+                stats = self.fit_preproc(y, wl_cm1)
+                ref_center = stats.get_center()
+                ref_halfw = self.halfwidth_cm1
+            elif (c := cube_maybe.stats.ref_center_cm1) is not None:
+                # use the stats provided
+                ref_center = c
+                ref_halfw = cube_maybe.stats.ref_halfwidth_cm1 or self.halfwidth_cm1
+            else:
+                raise RuntimeError(
+                    f"Invalid cube and stats combination {cube_maybe=}, {stats=}"
+                )
+            y = _normalize_to_peak(y, wl_cm1, ref_center, ref_halfw)
+            return y, stats, ref_center, ref_halfw
+
+        stats = self.fit_preproc(y, wl_cm1)
+        return y, stats, ref_center, ref_halfw
 
 
 @dataclass(frozen=True)
@@ -463,11 +683,6 @@ class DataArtifacts:
 class CubeStats:
     cube: Cube
     stats: PreprocStats
-
-
-def _use_peak_norm(peak_cfg: PeakNormConfig) -> bool:
-    # safer than comparing strings like "none"/"None"
-    return not isinstance(peak_cfg.mode, NonePeakNorm)
 
 
 def preprocess_cube(
@@ -496,31 +711,21 @@ def preprocess_cube(
     y_flat = cube.flatten()  # (N, M)
     # remove spikes
     y = _median_spike_removal(y_flat, pre_config.spike_kernel_size)
+
     # find & remove baseline
-    y = _poly_baseline_subtract(y, wl_cm1, degree=pre_config.baseline_poly)
+    baseline_method = pre_config.baseline
+    if isinstance((degree := baseline_method), int):
+        y = _poly_baseline_subtract(y, wl_cm1, degree=degree)
+    elif isinstance(baseline_method, ALS):
+        _baseline, y = baseline_method.remove_baseline(y)
+
     # smoothing
     if (s := pre_config.smoothing) is not None:
-        y = savgol_filter(y, window_length=s.window, polyorder=s.poly, axis=1).astype(
-            np.float32
-        )
+        y = s.smooth(y)
 
     # normalization to peak
-    ref_center = None
-    ref_halfw = None
-    stats = None
-    if pre_config.mode == SpectralMode.RAMAN and _use_peak_norm(peak_cfg):
-        if isinstance(cube_maybe, Cube):
-            stats = peak_cfg.fit_preproc(y, wl_cm1)
-            ref_center = stats.get_center()
-            ref_halfw = peak_cfg.halfwidth_cm1
-        elif (c := cube_maybe.stats.ref_center_cm1) is not None:
-            # use the stats provided
-            ref_center = c
-            ref_halfw = cube_maybe.stats.ref_halfwidth_cm1 or peak_cfg.halfwidth_cm1
-        else:
-            raise RuntimeError(f"Invalid cube and stats combination {cube=}, {stats=}")
-
-        y = _normalize_to_peak(y, wl_cm1, ref_center, ref_halfw)
+    if pre_config.mode == SpectralMode.RAMAN:
+        y, stats, ref_center, ref_halfw = peak_cfg.normalize(cube_maybe, y, wl_cm1)
 
     # compute stats for testing set
     stats = stats if stats is not None else PreprocStats(ref_center, ref_halfw)
