@@ -9,6 +9,7 @@ from loguru import logger
 import numpy as np
 from scipy import sparse
 from scipy.signal import find_peaks, medfilt, savgol_filter
+from scipy.sparse import csc_array
 from scipy.sparse.linalg import spsolve
 
 from pyspectral.config import ArrayF, ArrayF32, Cube, FlatMap, MeanArray, StdArray
@@ -245,7 +246,7 @@ def _median_spike_removal(y: FlatMap, k: int | None) -> ArrayF32:
     """Apply 1D median filter of window k to each spectrum (rows of y)."""
     if k is None:
         logger.debug("No median spike removal pre-processing done.")
-        return y
+        return y.get()
     if k % 2 == 0:
         k += 1
         logger.warning(f"Adjusted kernel size to be odd: {k=}")
@@ -329,7 +330,7 @@ def find_peak_in_window(
         k = int(np.argmax(y))
         return float(np.mean(wl[mask][max(k - 1, 0) : min(k + 2, y.size)]))
     # Choose the peak with max prominence
-    prom_peak = int(np.argmax(props["prominences"]))  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    prom_peak = int(np.argmax(props["prominences"]))
     i_win = int(idx[prom_peak])
 
     # Map back to full indices
@@ -352,13 +353,10 @@ class SmoothCfg:
                 f"Smooth polynomial value must be within range of (1-10), found {self.poly=}"
             )
 
-    def smooth(self, y) -> ArrayF32:
+    def smooth(self, y: ArrayF32) -> ArrayF32:
         return savgol_filter(
             y, window_length=self.window, polyorder=self.poly, axis=1
         ).astype(np.float32)
-
-
-BaselinePolynomialDegree = NewType("BaselinePolynomialDegree", int)
 
 
 @dataclass
@@ -383,7 +381,7 @@ class ALS:
     def remove_baseline(
         self,
         y: np.ndarray,
-    ) -> tuple[np.ndarray, FlatMap]:
+    ) -> tuple[np.ndarray, ArrayF32]:
         """
         Robust baseline via asymmetric least squares (ALS).
 
@@ -424,7 +422,7 @@ class ALS:
         # Build second-difference operator (D^2), a second derivative to act on z
         # d_op acts as a penalty to non-smooth curves, these high slope regions
         # are likely to be peaks, not a part of the baseline
-        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")
+        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")  # pyright: ignore[reportArgumentType]
         dt_d = (d_op.T @ d_op).tocsc()
 
         # Construct peak mask (shared across rows)
@@ -452,8 +450,9 @@ class ALS:
             DOWN_FACTOR = 0.1
             p_local[peak_mask_batch[i]] = min(p * DOWN_FACTOR, 0.0005)
 
+            zi = None
             zi_prev = None
-            for it in range(self.n_iter):
+            for _it in range(self.n_iter):
                 # Construct A = W + λ D^T D, and solve for z in Az = Wy
                 W = sparse.diags(wi, 0, shape=(C, C), format="csc")
                 A = W + (lam * dt_d)
@@ -462,7 +461,7 @@ class ALS:
 
                 # check for convergence
                 if zi_prev is not None:
-                    denom = max(np.linalg.norm(zi_prev), 1e-12)
+                    denom = max(np.linalg.norm(zi_prev), 1e-12)  # pyright: ignore[reportCallIssue, reportArgumentType]
                     if (np.linalg.norm(zi - zi_prev) / denom) < self.tolerance:
                         break
                 # if not, continue on iterating
@@ -480,9 +479,10 @@ class ALS:
         baseline = Z.reshape(orig_shape)
         baseline = np.moveaxis(baseline, -1, axis)
         corrected = np.moveaxis(y.reshape(orig_shape), -1, axis) - baseline
-        return baseline, FlatMap.make(corrected)
+        return baseline, corrected
 
 
+BaselinePolynomialDegree = NewType("BaselinePolynomialDegree", int)
 type BaselineMethod = BaselinePolynomialDegree | ALS | None
 
 
@@ -491,7 +491,7 @@ class PreConfig:
     smoothing: SmoothCfg | None = None
     mode: SpectralMode = SpectralMode.RAMAN
     spike_kernel_size: int | None = 7
-    baseline: BaselineMethod = 2
+    baseline: BaselineMethod = 2  # pyright: ignore[reportAssignmentType]
 
     def __post_init__(self) -> None:
         if self.smoothing and ((w := self.smoothing.window) % 2 == 0):
@@ -517,6 +517,7 @@ class PreConfig:
     @classmethod
     def make_als(
         cls,
+        spike_removal: bool = False,
         mode: SpectralMode = SpectralMode.RAMAN,
         smoothness: float = 1e5,
         asymmetry: float = 0.01,
@@ -524,16 +525,17 @@ class PreConfig:
         tolerance: float = 1e-4,
     ) -> PreConfig:
         """Provide a minimal pre-processing config."""
+        spike_kernel_size = 7 if spike_removal else None
         return cls(
-            None,
-            mode,
-            ALS(
+            smoothing=None,
+            mode=mode,
+            spike_kernel_size=spike_kernel_size,
+            baseline=ALS(
                 smoothness=smoothness,
                 asymmetry=asymmetry,
                 n_iter=n_iter,
                 tolerance=tolerance,
             ),
-            None,
         )
 
     @classmethod
@@ -643,7 +645,7 @@ class PeakNormConfig:
                 return PreprocStats(None, None)
 
     def normalize(
-        self, cube_maybe: Cube | CubeStats, y: ArrayF, wl_cm1: ArrayF
+        self, cube_maybe: Cube | CubeStats, y: ArrayF32, wl_cm1: ArrayF
     ) -> NormResult:
         ref_center = None
         ref_halfw = None
@@ -726,6 +728,8 @@ def preprocess_cube(
     # normalization to peak
     if pre_config.mode == SpectralMode.RAMAN:
         y, stats, ref_center, ref_halfw = peak_cfg.normalize(cube_maybe, y, wl_cm1)
+    else:
+        raise NotImplementedError()
 
     # compute stats for testing set
     stats = stats if stats is not None else PreprocStats(ref_center, ref_halfw)
