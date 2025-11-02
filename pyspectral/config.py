@@ -88,7 +88,7 @@ class FlatMap:
         elif isinstance(key, slice):
             return self._array[key]
         else:
-            raise TypeError("Invalid key type")
+            return self._array[key]
 
     @property
     def shape(self) -> tuple[int, int]:
