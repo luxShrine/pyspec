@@ -19,10 +19,13 @@ from tqdm import tqdm
 
 from pyspectral.config import RNG, ArrayF, ArrayF32, FlatMap
 from pyspectral.features import (
+    ALS,
+    BaselineMethod,
     CubeStats,
     DataArtifacts,
     FoldStat,
     PairRow,
+    PeakNormConfig,
     PreConfig,
     fit_diag_affine,
     predict_diag_affine,
@@ -199,20 +202,32 @@ class SpectraPair:
         ref_wl: None | ArrayF = None,
         max_pixels_per_scene: int | None = 20_000,
         spike_k: int | None = 7,
-        base_poly: int | None = 2,
+        baseline_method: BaselineMethod = None,
         s_poly: int | None = 3,
         s_window: int | None = 15,
+        peak_cfg: PeakNormConfig | None = None,
     ) -> tuple[SpectraPair, DataArtifacts]:
         values = Annotations.read(csv_path, base_dir)
         x_list, y_list = [], []
         stats_per_scene, wls_per_scene, lens = [], [], []
 
-        pre_config = PreConfig.make(
-            spike_kernel_size=spike_k,
-            baseline_poly=base_poly,
-            s_poly=s_poly,
-            s_window=s_window,
-        )
+        if isinstance(baseline_method, int):
+            pre_config = PreConfig.make_poly(
+                spike_kernel_size=spike_k,
+                baseline_poly=baseline_method,
+                s_poly=s_poly,
+                s_window=s_window,
+            )
+        elif isinstance(baseline_method, ALS):
+            pre_config = PreConfig.make_als(
+                smoothness=baseline_method.smoothness,
+                asymmetry=baseline_method.asymmetry,
+                n_iter=baseline_method.n_iter,
+                tolerance=baseline_method.tolerance,
+            )
+        else:
+            pre_config = PreConfig.make_min()
+
         for r in values.rows:
             raw_map, prc_map = r.retrieve_maps()
 
@@ -224,11 +239,13 @@ class SpectraPair:
                 cube_maybe=cube_x,
                 wl_cm1=common_wl,
                 pre_config=pre_config,
+                peak_cfg=peak_cfg,
             )
             cube_y, _ = preprocess_cube(
                 cube_maybe=CubeStats(cube_y, train_stats),
                 wl_cm1=common_wl,
                 pre_config=pre_config,
+                peak_cfg=peak_cfg,
             )
 
             xpix = cube_x.get().reshape(-1, cube_x.M).astype(np.float64)
