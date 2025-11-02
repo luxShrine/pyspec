@@ -41,7 +41,9 @@ def test_loading_hsi_map():
 def test_spectral_pair():
     from sklearn.model_selection import KFold
 
-    pair = pyd.SpectraPair(spectra.get(), spectra_gt.get())
+    pair = pyd.SpectraPair(
+        spectra.get().astype(np.float64), spectra_gt.get().astype(np.float64)
+    )
     ncomp = max(2, min(pair.X_raw.shape[0] // 2, 32))
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
     pred = pair.pcr_predict(cv)
