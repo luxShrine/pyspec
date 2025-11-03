@@ -9,6 +9,7 @@ from sklearn.metrics import root_mean_squared_error
 from pyspectral.config import ArrayF, Cube, ModelType
 from pyspectral.dataset import Annotations, KFolds, SpectraPair
 from pyspectral.features import (
+    BaselinePolynomialDegree,
     CubeStats,
     PreConfig,
     PreprocStats,
@@ -120,9 +121,11 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
     biases = [0.0, 1e-4, normal_bias]
     n_splits = [4]
     pre_processing = [
-        PreConfig(smoothing=None, spike_kernel_size=1, baseline_poly=1),
-        PreConfig(smoothing=None, spike_kernel_size=7, baseline_poly=2),
-        PreConfig(smoothing=SmoothCfg(), spike_kernel_size=7, baseline_poly=2),
+        PreConfig(
+            smoothing=None, spike_kernel_size=1, baseline=BaselinePolynomialDegree(1)
+        ),
+        PreConfig(smoothing=None, baseline=BaselinePolynomialDegree(2)),
+        PreConfig(smoothing=SmoothCfg(), baseline=BaselinePolynomialDegree(2)),
     ]
     models = [ModelType.LRSM, ModelType.LSM]
     # prevent training with different penalties that won't apply to respective types
@@ -144,7 +147,7 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
             csv,
             data,
             spike_k=pre.spike_kernel_size,
-            base_poly=pre.baseline_poly,
+            baseline_method=pre.baseline,
             s_poly=s_poly,
             s_window=s_window,
         )
