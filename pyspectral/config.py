@@ -54,6 +54,8 @@ class ModelType(StrEnum):
 
 # -- physics types -------------------------------------------------------
 
+# Characteristic spectral features in 800–1000 cm⁻¹ and 1300–1500 cm⁻¹ for alginate, and 1500–1800 cm⁻¹
+
 
 class SetType(StrEnum):
     PROCESSED = auto()
@@ -83,12 +85,7 @@ class FlatMap:
         return f"Cube(shape={self.shape}, dtype={self._array.dtype})"
 
     def __getitem__(self, key: slice | int) -> Any | ArrayF32:
-        if isinstance(key, int):
-            return self._array[key]
-        elif isinstance(key, slice):
-            return self._array[key]
-        else:
-            return self._array[key]
+        return self._array[key]
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -101,8 +98,6 @@ class FlatMap:
 
     @classmethod
     def make(cls, array: ArrayF32) -> FlatMap:
-        if not isinstance(array, np.ndarray):
-            raise TypeError(f"Must be a numpy array, got {type(array)=}")
         if array.ndim != 2:
             raise ValueError(f"Cube must be 3D (H, W, M). Got shape={array.shape!r}")
         N, C = array.shape
@@ -119,12 +114,7 @@ class Cube:
     M: int
 
     def __getitem__(self, key: slice | int) -> Any | ArrayF32:
-        if isinstance(key, int):
-            return self._cube[key]
-        elif isinstance(key, slice):
-            return self._cube[key]
-        else:
-            raise TypeError("Invalid key type")
+        return self._cube[key]
 
     def __array__(self, dtype: npt.DTypeLike | None = None) -> npt.ArrayLike:
         return np.asarray(self._cube, dtype=dtype)  # enables np.asarray(Cube)
@@ -141,7 +131,9 @@ class Cube:
 
     def flatten(self) -> FlatMap:
         """Reshape the cube to flat array: from (H, W, M) -> (H*W, M)."""
-        return FlatMap.make(self._cube.reshape(-1, self.M).astype(np.float32, copy=False))
+        return FlatMap.make(
+            self._cube.reshape(-1, self.M).astype(np.float32, copy=False)
+        )
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -151,8 +143,6 @@ class Cube:
     @classmethod
     def make(cls, cube: ArrayF32) -> Cube:
         """Create a spectral Cube instance from a proper numpy array."""
-        if not isinstance(cube, np.ndarray):
-            raise TypeError(f"Cube must be a numpy array, got {type(cube)=}")
         if cube.ndim != 3:
             raise ValueError(f"Cube must be 3D (H, W, M). Got shape={cube.shape!r}")
         # grab the three dimensions
@@ -160,7 +150,9 @@ class Cube:
         return cls(_cube=cube, H=H, W=W, M=M)
 
     @classmethod
-    def from_flat(cls, flat_cube: ArrayF32, height: int, width: int, spec_bands: int) -> Cube:
+    def from_flat(
+        cls, flat_cube: ArrayF32, height: int, width: int, spec_bands: int
+    ) -> Cube:
         """Reshape flat array to cube: from (H*W, M) -> (H, W, M)."""
         return cls.make(flat_cube.reshape(height, width, spec_bands).astype(np.float32))
 
@@ -171,7 +163,11 @@ try:
     from tqdm import tqdm
 
     logger.remove(0)
-    logger.add(lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True, diagnose=False)
-    logger.add("app.log", rotation="1 week", level="DEBUG", enqueue=True, serialize=True)  # file
+    logger.add(
+        lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True, diagnose=False
+    )
+    logger.add(
+        "app.log", rotation="1 week", level="DEBUG", enqueue=True, serialize=True
+    )  # file
 except ModuleNotFoundError:
     pass
