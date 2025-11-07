@@ -3,13 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 from pathlib import Path
-from typing import NewType
+from typing import NewType, cast
 
 from loguru import logger
 import numpy as np
 from scipy import sparse
 from scipy.signal import find_peaks, medfilt, savgol_filter
-from scipy.sparse import csc_array
 from scipy.sparse.linalg import spsolve
 
 from pyspectral.config import ArrayF, ArrayF32, Cube, FlatMap, MeanArray, StdArray
@@ -422,7 +421,7 @@ class ALS:
         # Build second-difference operator (D^2), a second derivative to act on z
         # d_op acts as a penalty to non-smooth curves, these high slope regions
         # are likely to be peaks, not a part of the baseline
-        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")  # pyright: ignore[reportArgumentType]
+        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")
         dt_d = (d_op.T @ d_op).tocsc()
 
         # Construct peak mask (shared across rows)
@@ -451,7 +450,7 @@ class ALS:
             p_local[peak_mask_batch[i]] = min(p * DOWN_FACTOR, 0.0005)
 
             zi = None
-            zi_prev = None
+            zi_prev: None | np.ndarray = None
             for _it in range(self.n_iter):
                 # Construct A = W + λ D^T D, and solve for z in Az = Wy
                 W = sparse.diags(wi, 0, shape=(C, C), format="csc")
@@ -461,8 +460,9 @@ class ALS:
 
                 # check for convergence
                 if zi_prev is not None:
-                    denom = max(np.linalg.norm(zi_prev), 1e-12)  # pyright: ignore[reportCallIssue, reportArgumentType]
-                    if (np.linalg.norm(zi - zi_prev) / denom) < self.tolerance:
+                    denom = cast(float, max(np.linalg.norm(zi_prev), 1e-12))
+                    numer = np.asarray(zi - zi_prev)
+                    if (np.linalg.norm(numer) / denom) < self.tolerance:
                         break
                 # if not, continue on iterating
                 zi_prev = zi
@@ -484,6 +484,7 @@ class ALS:
 
 BaselinePolynomialDegree = NewType("BaselinePolynomialDegree", int)
 type BaselineMethod = BaselinePolynomialDegree | ALS | None
+DEFAULT_BASE_POLY = BaselinePolynomialDegree(2)
 
 
 @dataclass
@@ -491,7 +492,7 @@ class PreConfig:
     smoothing: SmoothCfg | None = None
     mode: SpectralMode = SpectralMode.RAMAN
     spike_kernel_size: int | None = 7
-    baseline: BaselineMethod = 2  # pyright: ignore[reportAssignmentType]
+    baseline: BaselineMethod = DEFAULT_BASE_POLY
 
     def __post_init__(self) -> None:
         if self.smoothing and ((w := self.smoothing.window) % 2 == 0):
