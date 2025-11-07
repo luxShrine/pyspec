@@ -54,8 +54,6 @@ class ModelType(StrEnum):
 
 # -- physics types -------------------------------------------------------
 
-# Characteristic spectral features in 800–1000 cm⁻¹ and 1300–1500 cm⁻¹ for alginate, and 1500–1800 cm⁻¹
-
 
 class SetType(StrEnum):
     PROCESSED = auto()
@@ -80,9 +78,6 @@ class FlatMap:
 
     def __len__(self) -> int:
         return self.N
-
-    def __repr__(self) -> str:
-        return f"Cube(shape={self.shape}, dtype={self._array.dtype})"
 
     def __getitem__(self, key: slice | int) -> Any | ArrayF32:
         return self._array[key]
@@ -121,9 +116,6 @@ class Cube:
 
     def __len__(self) -> int:
         return self.H
-
-    def __repr__(self) -> str:
-        return f"Cube(shape={self.shape}, dtype={self._cube.dtype})"
 
     def get(self) -> ArrayF32:
         """Get the underlying cube explicitly."""
