@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, override
 
+from beartype import beartype
+from jaxtyping import Float, Int, jaxtyped
 from loguru import logger
 import numpy as np
 import torch
@@ -146,6 +148,78 @@ class OOFStats:
         return out
 
 
+# tensor dimension checks
+type BatchTensor = Float[Tensor, "B c1 H W"]
+type ClassTensor = Float[Tensor, "B F"]
+type OneDimTensor = Float[Tensor, "1"]
+type ZeroDimTensor = Float[Tensor, ""]
+
+# -- conv model
+
+
+def calc_layer_adj(k: int, stride: int, pad: int, h: int, w: int):
+    """Adjusts the height/width based on parameters of the pool/convulution layer."""
+    num = (2 * pad) - (k - 1) - 1
+    frac = num / stride
+    h += np.floor(frac + 1)
+    w += np.floor(frac + 1)
+
+
+class ConvSpectralClassifier(nn.Module):
+    def __init__(self, c_in: int, c_out: int, h: int, w: int):
+        super().__init__()
+        # TODO: calcuate height/width?, currently single pixels, thus 1x1
+        k_conv: int = 3
+        s_conv: int = 1
+        pad_conv = 2
+        k_pool: int = 3  # TODO: what is the desired pool kernel size ?
+        s_pool: int = 1
+        pad_pool = 0
+
+        conv1_out = 128  # TODO: decide the output size
+        conv2_out = 64  # TODO: decide the output size
+        linear1_out = 512  # TODO: decide on the output size
+        self.features: nn.Sequential = nn.Sequential(
+            nn.Conv2d(c_in, conv1_out, kernel_size=k_conv, padding=pad_conv),
+            nn.Tanh(),  # Kurz et al. uses ReLU
+            nn.MaxPool2d(k_pool, stride=s_pool),
+            nn.Conv2d(conv1_out, conv2_out, kernel_size=k_conv, padding=pad_conv),
+            nn.Tanh(),
+            nn.MaxPool2d(k_pool, stride=s_pool),
+        )
+        self.features.compile(backend="cudagraphs")
+        calc_layer_adj(k_conv, s_conv, pad_conv, h, w)  # conv1: ...,...,H+2,W+2
+        calc_layer_adj(k_pool, s_pool, pad_pool, h, w)  # maxpool1
+        calc_layer_adj(k_conv, s_conv, pad_conv, h, w)  # conv2: ...,...,H+2,W+2
+        calc_layer_adj(k_pool, s_pool, pad_pool, h, w)  # maxpool2
+        flatten_out = (h * w) * conv2_out
+        self.head: nn.Sequential = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flatten_out, linear1_out),
+            nn.Tanh(),
+            nn.Linear(linear1_out, c_out),
+        )
+
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, x: BatchTensor) -> ClassTensor:
+        """
+        (B, C, H, W) -> returns (B, C_out)
+        """
+        features: Float[Tensor, "B C2 H2 W2"] = self.features(x)
+        y: ClassTensor = self.head(features)
+        return y
+
+    def get_loss_managers(
+        self, lr: float = 5e-4, wd: float = 1e-4
+    ) -> tuple[nn.CrossEntropyLoss, torch.optim.AdamW]:
+        """Create the optimizer and loss function directly from object."""
+        return (
+            nn.CrossEntropyLoss(),
+            torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd),
+        )
+
+
 # -- Low Rank, less complexity less memory
 
 
@@ -161,24 +235,14 @@ class LowRankSpectralMapper(nn.Module):
         nn.init.normal_(self.U, std=1e-3)
         self.bias: nn.Parameter = nn.Parameter(torch.zeros(c_in))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, x: BatchTensor) -> BatchTensor:
         """
         (B, C, H, W)         -> returns (B, C, H, W)
         """
-        orig_ndim = x.ndim
-        if orig_ndim == 4:  # (B,C,1,1)
-            B, C = x.shape[:2]
-            x_flat = x.view(B, C)  # (B,C)
-        elif orig_ndim == 3:  # (C,1,1) single pixel, no batch
-            C = x.shape[0]
-            x_flat = x.view(1, C)  # (1,C)
-        elif orig_ndim == 2:  # (B,C)
-            x_flat = x
-        elif orig_ndim == 1:  # (C,)
-            x_flat = x.view(1, -1)  # (1,C)
-        else:
-            raise ValueError(f"Unexpected input shape {x.shape}")
-
+        B, C = x.shape[:2]
+        x_flat: Float[Tensor, "batch c1"] = x.view(B, C)
         # sanity check channel dimension
         if x_flat.shape[1] != self.V.shape[0]:
             raise RuntimeError(
@@ -186,22 +250,12 @@ class LowRankSpectralMapper(nn.Module):
             )
 
         # (B,C) @ (C,r) -> (B,r) -> (B,C)
-        corr = (x_flat @ self.V) @ self.U.t()
-        y_flat = x_flat + corr + self.bias  # broadcast bias (C,)
+        corr: Float[Tensor, "batch r"] = (x_flat @ self.V) @ self.U.t()
+        # broadcast bias (C,)
+        y_flat: Float[Tensor, "batch c1"] = x_flat + corr + self.bias
+        y: BatchTensor = y_flat.unsqueeze(-1).unsqueeze(-1)
 
-        # restore original shape
-        if orig_ndim == 4:
-            reshaped = y_flat.view(-1, y_flat.shape[1], 1, 1)
-        elif orig_ndim == 3:
-            reshaped = y_flat.view(y_flat.shape[1], 1, 1)
-        elif orig_ndim == 2:
-            reshaped = y_flat
-        else:  # orig_ndim == 1
-            reshaped = y_flat.view(-1)
-        if isinstance(reshaped, torch.Tensor):
-            return reshaped
-        else:
-            raise TypeError(f"Reshaped tensor is not a tensor type f{type(reshaped)=}")
+        return y
 
     def get_loss_managers(
         self, lr: float = 5e-4, wd: float = 1e-4
@@ -221,8 +275,12 @@ class LowRankIdentityPenalty(nn.Module):
         self.lam_id: float = band_penalty.id
         self.lam_bias: float = band_penalty.bias
 
-    def forward(self, mapper: LowRankSpectralMapper) -> torch.Tensor:
-        loss = self.lam_id * (mapper.U.pow(2).sum() + mapper.V.pow(2).sum())
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, mapper: LowRankSpectralMapper) -> ZeroDimTensor:
+        loss: ZeroDimTensor = self.lam_id * (
+            mapper.U.pow(2).sum() + mapper.V.pow(2).sum()
+        )
         if self.lam_bias:
             loss = loss + self.lam_bias * mapper.bias.pow(2).sum()
         return loss
@@ -247,7 +305,9 @@ class LinearSpectralMapper(nn.Module):
                 self.proj.weight[i, i, 0, 0] = 1.0
             nn.init.zeros_(self.proj_bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, x: BatchTensor) -> BatchTensor:
         return get_tensor(self.proj(x))
 
     def get_loss_managers(
@@ -280,22 +340,24 @@ class IdentityBandedPenalty(nn.Module):
         self.lam_id: float = band_penalty.id
         self.off_diag_penalty: float = band_penalty.off_diag
 
-    def _sum_sq_diagonals(self, W: torch.Tensor, kmax: int) -> torch.Tensor:
-        """sum_{k=-kmax..kmax} ||diag_k(W)||_2^2  (prevents CxC masks)"""
-        s = torch.sum(torch.diagonal(W, offset=0).pow(2))
+    def _sum_sq_diagonals(self, W: Tensor, kmax: int) -> ZeroDimTensor:
+        """sum_{k=-kmax..kmax} ||diag_k(W)||_2^2"""
+        s: ZeroDimTensor = torch.sum(torch.diagonal(W, offset=0).pow(2))
         for k in range(1, kmax + 1):
             s = s + torch.sum(torch.diagonal(W, offset=k).pow(2))
             s = s + torch.sum(torch.diagonal(W, offset=-k).pow(2))
         return s
 
-    def forward(self, conv1x1: nn.Conv2d) -> torch.Tensor:
-        W = conv1x1.weight.squeeze(-1).squeeze(-1)  # (C,C)
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, conv1x1: nn.Conv2d) -> ZeroDimTensor:
+        W: Float[Tensor, "c1 c1"] = conv1x1.weight.squeeze(-1).squeeze(-1)  # (C,C)
         # (C,C) -> (1)
-        if isinstance(self.eye, torch.Tensor):
-            loss_id = torch.sum((W - self.eye) ** 2) * self.lam_id
-            frob_2 = torch.sum(W * W)  # Frobenius solution r1 == r2
-            band_energy = self._sum_sq_diagonals(W, self.band)
-            offband_energy = frob_2 - band_energy
+        if isinstance(self.eye, Tensor):
+            loss_id: ZeroDimTensor = torch.sum((W - self.eye) ** 2) * self.lam_id
+            frob_2: ZeroDimTensor = torch.sum(W * W)  # Frobenius solution r1 == r2
+            band_energy: ZeroDimTensor = self._sum_sq_diagonals(W, self.band)
+            offband_energy: ZeroDimTensor = frob_2 - band_energy
             return loss_id + self.off_diag_penalty * offband_energy  # (1)
         else:
             raise TypeError(f"self.eye is not tensor: {type(self.eye)=}")
