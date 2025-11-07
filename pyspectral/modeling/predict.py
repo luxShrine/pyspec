@@ -25,8 +25,8 @@ type LossCompare = tuple[list[FoldPlot], ClassicalPredict]
 class FoldPlot:
     def __init__(self, oof_stats: OOFStats, label: str):
         all_loss = oof_stats.get_loss()
-        self.train_loss = all_loss.epoch_loss_store.train
-        self.test_loss = all_loss.epoch_loss_store.test
+        self.train_loss: ArrayF = all_loss.epoch_loss_store.train
+        self.test_loss: ArrayF = all_loss.epoch_loss_store.test
         self.label: str = label
 
 
@@ -40,8 +40,9 @@ class ClassicalPredict:
 class PredictData:
     pred_cube: Cube
     proc_cube: Cube
+    raw_cube: Cube
     wl: ArrayF
-    scene_stats: list[PreprocStats]
+    # scene_stats: list[PreprocStats]
     num_center: float
     den_center: float = field(init=False)
 
@@ -64,28 +65,34 @@ def predict_cube(
     """
     # Find the per-scene slice in the flattened arrays
     values = Annotations.read(csv_path, base_dir)
-    shapes, wls, lens, prc_cubes, pre_stats = [], [], [], [], []
+    shapes, wls, lens, raw_cubes, prc_cubes, pre_stats = [], [], [], [], [], []
     # compute cumulative lengths (H*W per scene)
     for i, r in enumerate(values.rows):
         raw_map, prc_map = r.retrieve_maps()
-        _cube_x, cube_y, common_wl = raw_map.check_same_wavelength_grid(
+        cube_x, cube_y, common_wl = raw_map.check_same_wavelength_grid(
             prc_map, ref_wl=None
         )
         height, width, m = cube_y.shape
-        shapes.append((height, width, m))
-        wls.append(common_wl)
-        lens.append(height * width)
-        prc_cubes.append(cube_y)
 
         scene_stats = stats.artifacts.scene_stats[i]
         pre_config = stats.artifacts.pre_config
-        cube_y_pre, pre_stat = preprocess_cube(
+        cube_x_pre, pre_stat = preprocess_cube(
+            cube_maybe=cube_x,
+            wl_cm1=common_wl,
+            pre_config=pre_config,
+        )
+        cube_y_pre, _ = preprocess_cube(
             cube_maybe=CubeStats(cube_y, scene_stats),
             wl_cm1=common_wl,
             pre_config=pre_config,
         )
-        prc_cubes.append(cube_y_pre)  # store the preprocessed version
+
+        shapes.append((height, width, m))
+        wls.append(common_wl)
+        lens.append(height * width)
         pre_stats.append(pre_stat)
+        prc_cubes.append(cube_y_pre)  # store the preprocessed version
+        raw_cubes.append(cube_x_pre)
 
     # Reshape ML OOF predictions for this scene back to one cube
     start, n_rows = np.cumsum([0] + lens[:-1])[idx], lens[idx]
@@ -95,10 +102,11 @@ def predict_cube(
     pred_cube = Cube.from_flat(stats.pred_orig[start : (start + n_rows)], H, W, M)
     if (nc := pre_stats[idx].ref_center_cm1) is not None:
         return PredictData(
-            pred_cube=pred_cube,
+            raw_cube=raw_cubes[idx],
             proc_cube=prc_cubes[idx],
+            pred_cube=pred_cube,
             wl=wl,
-            scene_stats=stats.artifacts.scene_stats,
+            # scene_stats=stats.artifacts.scene_stats,
             num_center=nc,
         )
     else:

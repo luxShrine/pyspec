@@ -11,7 +11,6 @@ from skimage.morphology import reconstruction
 from sklearn.metrics import adjusted_rand_score, auc, jaccard_score, roc_curve
 
 from pyspectral.config import ArrayF, ArrayF32, Cube, PlotType
-from pyspectral.features import preprocess_cube
 from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 
 # Binary operations reference:
@@ -79,8 +78,8 @@ def ratio_map(
     wl: ArrayF,
     num_center: float,
     den_center: float,
-    halfwidth: float = 6.0,
-    smooth_px: int = 1,
+    halfwidth: float,
+    smooth_px: int,
 ) -> ArrayF:
     """
     cube_proc: (H,W,M) processed or normalized spectra
@@ -122,11 +121,9 @@ def overlay_boundary(
     ax.set_axis_off()
 
 
-def compare_boundaries(
-    plot_data: PredictData, vid_labels: ArrayF | None = None, up: bool = False
-) -> dict[str, float]:
+def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, float]:
     """
-    Build a ratio boundary (and compare to VID if provided).
+    Build a ratio boundary.
 
     up: bool default: False, Whether or not to zoom into the array using spline interpolation.
     """
@@ -139,47 +136,58 @@ def compare_boundaries(
         halfwidth=26.0,
         smooth_px=1,
     )
+    r_raw = ratio_map_cube(plot_data.raw_cube)
     r_proc = ratio_map_cube(plot_data.proc_cube)
     r_pred = ratio_map_cube(plot_data.pred_cube)
 
     # masks try hysteresis and maybe fallback to Otsu
+    boundary_raw = Boundary.create_hysteresis_mask(r_raw)
     boundary_proc = Boundary.create_hysteresis_mask(r_proc)
     boundary_pred = Boundary.create_hysteresis_mask(r_pred)
-    boundary_xor = boundary_proc.boundary ^ boundary_pred.boundary  # type: ignore
+    prc_pred_boundary_xor = boundary_proc.boundary ^ boundary_pred.boundary  # type: ignore
+    raw_pred_boundary_xor = boundary_raw.boundary ^ boundary_pred.boundary  # type: ignore
+    rp_boundary_xor = boundary_raw.boundary ^ boundary_proc.boundary  # type: ignore
 
     # per-pixel RMSE, across bands
-    rmse_map = rmse_per_pixel(plot_data.proc_cube, plot_data.pred_cube)
+    prc_pred_rmse_map = rmse_per_pixel(plot_data.proc_cube, plot_data.pred_cube)
+    raw_pred_rmse_map = rmse_per_pixel(plot_data.raw_cube, plot_data.pred_cube)
+    rp_rmse_map = rmse_per_pixel(plot_data.raw_cube, plot_data.proc_cube)
 
     metrics = {}
-    roc_xy = None
-    if vid_labels is not None:
-        y_true = (vid_labels.ravel() > 0).astype(int)  # choose “inside” class as >0
-        y_score = r_pred.ravel().astype(float)
-        fpr, tpr, _ = roc_curve(y_true, y_score)
-        metrics["AUC"] = float(auc(fpr, tpr))
-        metrics["IoU"] = float(
-            jaccard_score(y_true, boundary_pred.mask.ravel().astype(int))
-        )
-        metrics["ARI"] = float(
-            adjusted_rand_score(y_true, boundary_pred.mask.ravel().astype(int))
-        )
-        roc_xy = (fpr, tpr)
 
     # figure
     scale = 20 if up else 1
     upscale = partial(zoom, zoom=scale, order=0)
     imgs = [
         (
-            upscale(r_proc),
+            upscale(r_raw),
             upscale(boundary_proc.boundary),
-            "Processed: ratio + boundary",
+            "Raw vs ML: ratio + boundary",
         ),
         (upscale(r_pred), upscale(boundary_pred.boundary), "ML OOF: ratio + boundary"),
-        (upscale(r_pred), upscale(boundary_xor), "Disagreement (XOR)"),
-        (upscale(rmse_map), None, "Per-pixel RMSE"),
+        (
+            upscale(r_raw),
+            upscale(boundary_proc.boundary),
+            "Raw vs Processed: ratio + boundary",
+        ),
+        (
+            upscale(r_pred),
+            upscale(prc_pred_boundary_xor),
+            "Processed-Pred Disagreement (XOR)",
+        ),
+        (
+            upscale(r_pred),
+            upscale(raw_pred_boundary_xor),
+            "Raw-Pred Disagreement (XOR)",
+        ),
+        (upscale(r_raw), upscale(rp_boundary_xor), "Raw-Processed Disagreement (XOR)"),
+        (upscale(prc_pred_rmse_map), None, "Proccessed-Pred Per-pixel RMSE"),
+        (upscale(rp_rmse_map), None, "Raw-Processed Per-pixel RMSE"),
+        (upscale(raw_pred_rmse_map), None, "Raw-Pred Per-pixel RMSE"),
     ]
     n = len(imgs)
-    fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4))
+    # TODO: make this figure 2 rows
+    _fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4))
     for ax, (base, edge, title) in zip(np.atleast_1d(axes), imgs):
         ax.imshow(base, cmap="gray")
         if edge is not None:
@@ -191,16 +199,6 @@ def compare_boundaries(
 
     plt.tight_layout()
     plt.show()
-
-    if roc_xy is not None:
-        fpr, tpr = roc_xy
-        plt.figure(figsize=(4, 4))
-        plt.plot(fpr, tpr)
-        plt.plot([0, 1], [0, 1], "--")
-        plt.xlabel("FPR")
-        plt.ylabel("TPR")
-        plt.title(f"ROC (AUC={metrics['AUC']:.3f})")
-        plt.show()
 
     return metrics
 
