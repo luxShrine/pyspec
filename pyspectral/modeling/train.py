@@ -4,20 +4,26 @@ from typing import Any
 from loguru import logger
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from pyspectral.config import ArrayF, ArrayF32, ModelType
-from pyspectral.dataset import KFolds, PixelSpectraDataset, SpectralData, SpectraPair
+from pyspectral.dataset import (
+    IndexArray,
+    KFolds,
+    PixelSpectraDataset,
+    SpectralData,
+    SpectraPair,
+)
 from pyspectral.features import DataArtifacts, FoldStat
 
-type Alignment = None | torch.Tensor | LinearSpectralMapper
+type Alignment = None | Tensor | LinearSpectralMapper
 
 
-def get_tensor(maybe_tens: torch.Tensor | Any) -> torch.Tensor:
+def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
     """Check that input is a tensor, return said tensor or raise TypeError."""
-    if isinstance(maybe_tens, torch.Tensor):
+    if isinstance(maybe_tens, Tensor):
         return maybe_tens
     else:
         raise TypeError(f"Input is not a tensor: {type(maybe_tens)}")
@@ -104,7 +110,7 @@ class OOFStats:
         best_preds_fold: list[ArrayF32] | None,
         yhat_te_std: ArrayF,
         yhat_te_orig: ArrayF,
-        test_idx: int,
+        test_idx: IndexArray,
         fold_epoch_loss: FoldLoss,
     ) -> None:
         """Update records of out of fold stats each fold."""
@@ -126,6 +132,7 @@ class OOFStats:
     def get_loss(self) -> EpochLosses:
         return EpochLosses(_fold_loss_store=self.epoch_loss)
 
+    @override
     def __repr__(self) -> str:
         """Display metrics stored."""
         rmse_diag_std = float(np.sqrt(((self.diag_std - self.true_std) ** 2).mean()))
@@ -147,20 +154,16 @@ class LowRankSpectralMapper(nn.Module):
 
     def __init__(self, c_in: int, rank: int = 64):
         super().__init__()
-        self.V = nn.Parameter(torch.zeros(c_in, rank))
-        self.U = nn.Parameter(torch.zeros(c_in, rank))
+        self.V: nn.Parameter = nn.Parameter(torch.zeros(c_in, rank))
+        self.U: nn.Parameter = nn.Parameter(torch.zeros(c_in, rank))
         # normal distribution initialization
         nn.init.normal_(self.V, std=1e-3)
         nn.init.normal_(self.U, std=1e-3)
-        self.bias = nn.Parameter(torch.zeros(c_in))
+        self.bias: nn.Parameter = nn.Parameter(torch.zeros(c_in))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Accepts:
-          (B, C)         -> returns (B, C)
-          (B, C, 1, 1)   -> returns (B, C, 1, 1)
-          (C,)           -> returns (C,)
-          (C, 1, 1)      -> returns (C, 1, 1)
+        (B, C, H, W)         -> returns (B, C, H, W)
         """
         orig_ndim = x.ndim
         if orig_ndim == 4:  # (B,C,1,1)
@@ -179,7 +182,7 @@ class LowRankSpectralMapper(nn.Module):
         # sanity check channel dimension
         if x_flat.shape[1] != self.V.shape[0]:
             raise RuntimeError(
-                f"Channel mismatch: x has C={x_flat.shape[1]} but mapper was built with C={self.V.shape[0]}"
+                f"Channel mismatch: x has C={x.shape[1]} but mapper was built with C={self.V.shape[0]}"
             )
 
         # (B,C) @ (C,r) -> (B,r) -> (B,C)
@@ -215,8 +218,8 @@ class LowRankIdentityPenalty(nn.Module):
 
     def __init__(self, band_penalty: BandPenalty):
         super().__init__()
-        self.lam_id = band_penalty.id
-        self.lam_bias = band_penalty.bias
+        self.lam_id: float = band_penalty.id
+        self.lam_bias: float = band_penalty.bias
 
     def forward(self, mapper: LowRankSpectralMapper) -> torch.Tensor:
         loss = self.lam_id * (mapper.U.pow(2).sum() + mapper.V.pow(2).sum())
@@ -237,7 +240,7 @@ class LinearSpectralMapper(nn.Module):
         super().__init__()
         self.proj: nn.Conv2d = nn.Conv2d(c, c, kernel_size=1, bias=True)
         with torch.no_grad():
-            self.proj_bias: torch.Tensor = get_tensor(self.proj.bias)
+            self.proj_bias: Tensor = get_tensor(self.proj.bias)
             # init near-identity to help small amount of data
             nn.init.zeros_(self.proj.weight)
             for i in range(c):
@@ -268,8 +271,7 @@ class LinearSpectralMapper(nn.Module):
 
 
 class IdentityBandedPenalty(nn.Module):
-    """λ||W−I||_F^2 on full matrix + μ * energy outside a +-band around diagonal,
-    computed without building a (C,C) mask."""
+    """λ||W−I||_F^2 on full matrix + μ * energy outside a ±band around diagonal"""
 
     def __init__(self, c: int, band_penalty: BandPenalty):
         super().__init__()
@@ -311,10 +313,9 @@ def init_linear_map(
     """Warm start a linear mapper via ridge regression solved in numpy space.
 
     Args:
-        raw: Training spectra prior to preprocessing, shape ``(n_samples, C)``.
-        prc: Processed spectra used as the regression targets, shape ``(n_samples, C)``.
+        raw: Training spectra prior to preprocessing, shape (N, C).
+        prc: Processed spectra used as the regression targets, shape (n_samples, C).
         lam_l2: Ridge penalty weight applied to stabilize the linear system.
-        model: Instance of :class:`LinearSpectralMapper` to receive the weights.
     """
     XT = raw.T  # (n_train, C)
     a = (XT @ raw) + (lam_l2 * np.eye(raw.shape[1]))
@@ -364,9 +365,6 @@ def get_model(
         case ModelType.LRSM:
             model = LowRankSpectralMapper(c_in, rank).to(device)
             penalty = LowRankIdentityPenalty(band_penalty).to(device)
-        case _:
-            model = LowRankSpectralMapper(c_in, rank).to(device)
-            penalty = LowRankIdentityPenalty(band_penalty).to(device)
     return model, penalty
 
 
@@ -384,7 +382,7 @@ def pick_device() -> torch.device:
 
 
 @torch.no_grad()
-def rmse(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+def rmse(y_true: Tensor, y_pred: Tensor) -> Tensor:
     """Compute the root-mean-squared error between predictions and targets.
 
     Args:
@@ -433,8 +431,8 @@ def create_dataloader(
 
 
 def apply_penalty(
-    model: SpectralMapper, penalty: Penalty | None, batch_loss: torch.Tensor
-) -> torch.Tensor:
+    model: SpectralMapper, penalty: Penalty | None, batch_loss: Tensor
+) -> Tensor:
     # determine penalty type
     if penalty is None:
         return batch_loss
@@ -483,7 +481,7 @@ def train_epoch(
             optimizer.step()
         elif isinstance(optimizer, torch.optim.LBFGS):
 
-            def closure() -> torch.Tensor:
+            def closure() -> Tensor:
                 optimizer.zero_grad()
                 pred = model(spectra.to(device))
                 loss = loss_fn(pred, spectra_prc.to(device))
@@ -543,7 +541,6 @@ def test_epoch(
 # -- training function
 
 
-# TODO: when inputs are standardized, make these inputs a dataclass
 def cv_train_model(
     spectral_pairs: SpectraPair,
     arts: DataArtifacts,
@@ -554,10 +551,8 @@ def cv_train_model(
     wd: float = 1e-4,
     model_type: str | ModelType = ModelType.LRSM,
     rank: int = 8,
-    band_penalty: BandPenalty = BandPenalty(),
+    band_penalty: BandPenalty | None = None,
     groups: bool = True,
-    poly_degree: int | None = None,
-    smooth_window: int | None = None,
     verbose: bool = False,
 ) -> OOFStats:
     """Train the mapper with cross-validation and accumulate out-of-fold diagnostics.
@@ -565,8 +560,6 @@ def cv_train_model(
     Args:
         csv_path: Path to annotations or metadata describing the spectra pairs.
         base_dir: Root directory for locating spectra assets on disk.
-        poly_degree: Degree of polynomial smoothing to implement to values.
-        smooth_window: Size of the smoothing window to applied.
         n_splits: Number of cross-validation folds to construct.
         groups: Optional grouping labels controlling the fold assignments.
         batch_size: Mini-batch size fed to the training loop.
@@ -580,8 +573,9 @@ def cv_train_model(
     Returns:
         Aggregated out-of-fold statistics capturing losses and predictions.
     """
+    band_penalty = BandPenalty() if band_penalty is None else band_penalty
     device = pick_device()
-    model_type = ModelType(model_type) if isinstance(model_type, str) else model_type
+    model_type = model_type if model_type is ModelType else ModelType(model_type)
     raw = spectral_pairs.X_raw.astype(np.float32)  # (N,C)
     prc = spectral_pairs.Y_proc.astype(np.float32)  # (N,C)
     if groups:
@@ -643,12 +637,12 @@ def cv_train_model(
                 best_vl_rmse = test_result.test_rmse
                 best_preds = test_result.predictions
 
-        if verbose:
-            tqdm.write(
-                f"Fold {fold + 1}/{total_folds} | train loss={tr_loss:.3g} | "
-                + f"test MSE={test_result.test_mse:.3g} | best test RMSE={best_vl_rmse:.3g} | "
-                + f"frac improved vs identity={test_result.fraction_improved:.3f}"
-            )
+            if verbose and (ep == (epochs)):
+                tqdm.write(
+                    f"Fold {fold + 1}/{total_folds} | train loss={tr_loss:.3g} | "
+                    + f"test MSE={test_result.test_mse:.3g} | best test RMSE={best_vl_rmse:.3g} | "
+                    + f"frac improved vs identity={test_result.fraction_improved:.3f}"
+                )
 
         # store metrics
         oof_stats.store(
