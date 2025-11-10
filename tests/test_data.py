@@ -1,7 +1,7 @@
 import numpy as np
 import numpy.typing as npt
 
-from pyspectral.config import DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
+from pyspectral.config import DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR, ArrayF
 import pyspectral.dataset as pyd
 import pyspectral.features as pyf
 import pyspectral.plots as plot
@@ -44,22 +44,24 @@ def test_spectral_pair():
     pair = pyd.SpectraPair(
         spectra.get().astype(np.float64), spectra_gt.get().astype(np.float64)
     )
-    ncomp = max(2, min(pair.X_raw.shape[0] // 2, 32))
+    _ncomp = max(2, min(pair.X_raw.shape[0] // 2, 32))
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
     pred = pair.pcr_predict(cv)
 
-    assert isinstance(pred, npt.ArrayLike)
+    assert isinstance(pred, np.ndarray)
 
 
 def test_plot_boundary():
-    num_center: float = 1654.0  # example Raman peak (adjust per sample)
-    den_center: float = 1446.0  # example Raman peak (adjust per sample)
-    ratio_map = plot.ratio_map(cube, wl, num_center, den_center)
+    NUM_CENTER: float = 1654.0  # example Raman peak
+    DEN_CENTER: float = 1446.0
+    HALFWIDTH: float = 12.0
+    SMOOTH_PX: int = 1
+    ratio_map = plot.ratio_map(cube, wl, NUM_CENTER, DEN_CENTER, HALFWIDTH, SMOOTH_PX)
 
     otsu_bound = plot.Boundary.create_otsu_mask(ratio_map)
     hys_bound = plot.Boundary.create_hysteresis_mask(ratio_map)
-    assert isinstance(otsu_bound.boundary, npt.ArrayLike)
-    assert isinstance(hys_bound.boundary, npt.ArrayLike)
+    assert isinstance(otsu_bound.boundary, np.ndarray)
+    assert isinstance(hys_bound.boundary, np.ndarray)
 
 
 def test_oof_stats():
