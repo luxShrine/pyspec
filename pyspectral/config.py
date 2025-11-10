@@ -54,6 +54,8 @@ class ModelType(StrEnum):
 
 # -- physics types -------------------------------------------------------
 
+REF_PHE = 1003.0
+
 
 class SetType(StrEnum):
     PROCESSED = auto()

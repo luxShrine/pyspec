@@ -10,7 +10,7 @@ from skimage.filters import threshold_otsu
 from skimage.morphology import reconstruction
 from sklearn.metrics import adjusted_rand_score, auc, jaccard_score, roc_curve
 
-from pyspectral.config import ArrayF, ArrayF32, Cube, PlotType
+from pyspectral.config import REF_PHE, ArrayF, ArrayF32, Cube, PlotType
 from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 
 # Binary operations reference:
@@ -94,6 +94,19 @@ def ratio_map(
     return ratio
 
 
+def safe_den_center(
+    den_center: float,
+    stats: PredictData,
+    *,
+    fallback: float = REF_PHE,
+    atol: float = 1.0,
+):
+    ref = stats.num_center
+    if abs(den_center - ref) <= atol:
+        return fallback
+    return den_center
+
+
 # -- Comparison/overlay
 
 
@@ -127,12 +140,13 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
 
     up: bool default: False, Whether or not to zoom into the array using spline interpolation.
     """
+    den = safe_den_center(den_center=REF_PHE, stats=plot_data)
     # Make ratio maps + masks + boundaries
     ratio_map_cube = partial(
         ratio_map,
         wl=plot_data.wl,
         num_center=plot_data.num_center,
-        den_center=plot_data.den_center,
+        den_center=den,
         halfwidth=26.0,
         smooth_px=1,
     )
