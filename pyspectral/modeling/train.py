@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Any, Literal, override
+from typing import Any, Literal
 
-from beartype import beartype
-from jaxtyping import Float, Int, jaxtyped
 from loguru import logger
 import numpy as np
 import torch
@@ -19,50 +17,44 @@ from pyspectral.dataset import (
     SpectraPair,
 )
 from pyspectral.features import DataArtifacts, FoldStat
-
-type Alignment = None | Tensor | LinearSpectralMapper
-
-
-def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
-    """Check that input is a tensor, return said tensor or raise TypeError."""
-    if isinstance(maybe_tens, Tensor):
-        return maybe_tens
-    else:
-        raise TypeError(f"Input is not a tensor: {type(maybe_tens)}")
+from pyspectral.modeling.models import (
+    BandPenalty,
+    Penalty,
+    SpectralMapper,
+    get_loss_managers,
+    get_model,
+)
 
 
-@dataclass
-class BandPenalty:
-    """
-    id: LRSM Identity regularization strength or ridge prior for warm starts.
-    off_diag: LRSM Off-diagonal penalty weight for linear spectral mappers.
-    band: LSM Bandwidth of the diagonal neighborhood preserved by the penalty.
-    """
-
-    id: float = 1e-2
-    off_diag: float = 1e-5  # 1e3 >= range >= 1e-5
-    band: int = 1
-    bias: float = 0.0
-
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TestResult:
-    test_mse: float
-    test_rmse: float
+    # BUG: not always using rmse, correct downstream use of this RMSE value
+    test_loss: float
     fraction_improved: float
     predictions: list[ArrayF32]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class EpochLoss:
     train: ArrayF  # shape: (Epoch count)
     test: ArrayF
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class FoldLoss:
-    tr_loss_store: ArrayF  # shape: (folds, Epoch count)
-    te_loss_store: ArrayF
+    train: ArrayF  # shape: (folds, Epoch count)
+    test: ArrayF
+    frac_improved: float
+    best_test: float
+
+    def repr(self) -> str:
+        out = (
+            f"train loss={self.train:.3g} | "
+            + f"test loss={self.test:.3g} | "
+            + f"best test loss={self.best_test:.3g} | "
+            + f"frac improved vs identity={self.frac_improved:.3f}"
+        )
+        return out
 
 
 @dataclass
@@ -79,8 +71,8 @@ class EpochLosses:
         te_all_folds = []
         folds = len(self._fold_loss_store)
         for fold in self._fold_loss_store:
-            tr_all_folds.append(fold.tr_loss_store / folds)
-            te_all_folds.append(fold.te_loss_store / folds)
+            tr_all_folds.append(fold.train / folds)
+            te_all_folds.append(fold.test / folds)
 
         tr_all_folds_ep = np.einsum("ij->j", np.vstack(tr_all_folds))
         te_all_folds_ep = np.einsum("ij->j", np.vstack(te_all_folds))
@@ -134,301 +126,6 @@ class OOFStats:
     def get_loss(self) -> EpochLosses:
         return EpochLosses(_fold_loss_store=self.epoch_loss)
 
-    @override
-    def __repr__(self) -> str:
-        """Display metrics stored."""
-        rmse_diag_std = float(np.sqrt(((self.diag_std - self.true_std) ** 2).mean()))
-        rmse_diag_orig = float(np.sqrt(((self.diag_orig - self._prc) ** 2).mean()))
-        rmse_std = float(np.sqrt(((self.pred_std - self.true_std) ** 2).mean()))
-        rmse_orig = float(np.sqrt(((self.pred_orig - self._prc) ** 2).mean()))
-        out = f"OOF RMSE (standardized space): {rmse_std:.6f}\n"
-        out += f"Diagonal affine OOF RMSE (std):  {rmse_diag_std:.6f}\n"
-        out += f"Diagonal affine OOF RMSE (orig): {rmse_diag_orig:.6f}\n"
-        out += f"OOF RMSE (original units):    {rmse_orig:.6f}"
-        return out
-
-
-# tensor dimension checks
-type BatchTensor = Float[Tensor, "B c1 H W"]
-type ClassTensor = Float[Tensor, "B F"]
-type OneDimTensor = Float[Tensor, "1"]
-type ZeroDimTensor = Float[Tensor, ""]
-
-# -- conv model
-
-
-def calc_layer_adj(k: int, stride: int, pad: int, h: int, w: int):
-    """Adjusts the height/width based on parameters of the pool/convulution layer."""
-    num = (2 * pad) - (k - 1) - 1
-    frac = num / stride
-    h += np.floor(frac + 1)
-    w += np.floor(frac + 1)
-
-
-class ConvSpectralClassifier(nn.Module):
-    def __init__(self, c_in: int, c_out: int, h: int, w: int):
-        super().__init__()
-        # TODO: calcuate height/width?, currently single pixels, thus 1x1
-        k_conv: int = 3
-        s_conv: int = 1
-        pad_conv = 2
-        k_pool: int = 3  # TODO: what is the desired pool kernel size ?
-        s_pool: int = 1
-        pad_pool = 0
-
-        conv1_out = 128  # TODO: decide the output size
-        conv2_out = 64  # TODO: decide the output size
-        linear1_out = 512  # TODO: decide on the output size
-        self.features: nn.Sequential = nn.Sequential(
-            nn.Conv2d(c_in, conv1_out, kernel_size=k_conv, padding=pad_conv),
-            nn.Tanh(),  # Kurz et al. uses ReLU
-            nn.MaxPool2d(k_pool, stride=s_pool),
-            nn.Conv2d(conv1_out, conv2_out, kernel_size=k_conv, padding=pad_conv),
-            nn.Tanh(),
-            nn.MaxPool2d(k_pool, stride=s_pool),
-        )
-        self.features.compile(backend="cudagraphs")
-        calc_layer_adj(k_conv, s_conv, pad_conv, h, w)  # conv1: ...,...,H+2,W+2
-        calc_layer_adj(k_pool, s_pool, pad_pool, h, w)  # maxpool1
-        calc_layer_adj(k_conv, s_conv, pad_conv, h, w)  # conv2: ...,...,H+2,W+2
-        calc_layer_adj(k_pool, s_pool, pad_pool, h, w)  # maxpool2
-        flatten_out = (h * w) * conv2_out
-        self.head: nn.Sequential = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flatten_out, linear1_out),
-            nn.Tanh(),
-            nn.Linear(linear1_out, c_out),
-        )
-
-    @jaxtyped(typechecker=beartype)
-    @override
-    def forward(self, x: BatchTensor) -> ClassTensor:
-        """
-        (B, C, H, W) -> returns (B, C_out)
-        """
-        features: Float[Tensor, "B C2 H2 W2"] = self.features(x)
-        y: ClassTensor = self.head(features)
-        return y
-
-    def get_loss_managers(
-        self, lr: float = 5e-4, wd: float = 1e-4
-    ) -> tuple[nn.CrossEntropyLoss, torch.optim.AdamW]:
-        """Create the optimizer and loss function directly from object."""
-        return (
-            nn.CrossEntropyLoss(),
-            torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd),
-        )
-
-
-# -- Low Rank, less complexity less memory
-
-
-class LowRankSpectralMapper(nn.Module):
-    """y = x + (x @ V) @ U^T  (near-identity low-rank correction)"""
-
-    def __init__(self, c_in: int, rank: int = 64):
-        super().__init__()
-        self.V: nn.Parameter = nn.Parameter(torch.zeros(c_in, rank))
-        self.U: nn.Parameter = nn.Parameter(torch.zeros(c_in, rank))
-        # normal distribution initialization
-        nn.init.normal_(self.V, std=1e-3)
-        nn.init.normal_(self.U, std=1e-3)
-        self.bias: nn.Parameter = nn.Parameter(torch.zeros(c_in))
-
-    @jaxtyped(typechecker=beartype)
-    @override
-    def forward(self, x: BatchTensor) -> BatchTensor:
-        """
-        (B, C, H, W)         -> returns (B, C, H, W)
-        """
-        B, C = x.shape[:2]
-        x_flat: Float[Tensor, "batch c1"] = x.view(B, C)
-        # sanity check channel dimension
-        if x_flat.shape[1] != self.V.shape[0]:
-            raise RuntimeError(
-                f"Channel mismatch: x has C={x.shape[1]} but mapper was built with C={self.V.shape[0]}"
-            )
-
-        # (B,C) @ (C,r) -> (B,r) -> (B,C)
-        corr: Float[Tensor, "batch r"] = (x_flat @ self.V) @ self.U.t()
-        # broadcast bias (C,)
-        y_flat: Float[Tensor, "batch c1"] = x_flat + corr + self.bias
-        y: BatchTensor = y_flat.unsqueeze(-1).unsqueeze(-1)
-
-        return y
-
-    def get_loss_managers(
-        self, lr: float = 5e-4, wd: float = 1e-4
-    ) -> tuple[nn.MSELoss, torch.optim.AdamW]:
-        """Create the optimizer and loss function directly from object."""
-        return (
-            nn.MSELoss(),
-            torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd),
-        )
-
-
-class LowRankIdentityPenalty(nn.Module):
-    """λ * (||U||_F^2 + ||V||_F^2). Optionally, bias L2, too."""
-
-    def __init__(self, band_penalty: BandPenalty):
-        super().__init__()
-        self.lam_id: float = band_penalty.id
-        self.lam_bias: float = band_penalty.bias
-
-    @jaxtyped(typechecker=beartype)
-    @override
-    def forward(self, mapper: LowRankSpectralMapper) -> ZeroDimTensor:
-        loss: ZeroDimTensor = self.lam_id * (
-            mapper.U.pow(2).sum() + mapper.V.pow(2).sum()
-        )
-        if self.lam_bias:
-            loss = loss + self.lam_bias * mapper.bias.pow(2).sum()
-        return loss
-
-
-# -- Higher rank, more complexity, more memory
-
-
-class LinearSpectralMapper(nn.Module):
-    """
-    Per-pixel spectral map: y = W x + b, with W in R^{C×C} via 1×1 conv.
-    """
-
-    def __init__(self, c: int):
-        super().__init__()
-        self.proj: nn.Conv2d = nn.Conv2d(c, c, kernel_size=1, bias=True)
-        with torch.no_grad():
-            self.proj_bias: Tensor = get_tensor(self.proj.bias)
-            # init near-identity to help small amount of data
-            nn.init.zeros_(self.proj.weight)
-            for i in range(c):
-                self.proj.weight[i, i, 0, 0] = 1.0
-            nn.init.zeros_(self.proj_bias)
-
-    @jaxtyped(typechecker=beartype)
-    @override
-    def forward(self, x: BatchTensor) -> BatchTensor:
-        return get_tensor(self.proj(x))
-
-    def get_loss_managers(
-        self, lr: float = 5e-4, wd: float = 1e-4, type: str = "AdamW"
-    ) -> tuple[nn.MSELoss, torch.optim.Optimizer]:
-        """Create the optimizer and loss function directly from object."""
-        if type == "LBFGS":
-            return (
-                nn.MSELoss(),
-                torch.optim.LBFGS(
-                    self.parameters(), lr=1e-2, max_iter=100, history_size=10
-                ),
-            )
-        elif type == "AdamW":
-            return (
-                nn.MSELoss(),
-                torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd),
-            )
-        else:
-            raise RuntimeError
-
-
-class IdentityBandedPenalty(nn.Module):
-    """λ||W−I||_F^2 on full matrix + μ * energy outside a ±band around diagonal"""
-
-    def __init__(self, c: int, band_penalty: BandPenalty):
-        super().__init__()
-        self.register_buffer("eye", torch.eye(c))  # (C,C)
-        self.band: int = band_penalty.band
-        self.lam_id: float = band_penalty.id
-        self.off_diag_penalty: float = band_penalty.off_diag
-
-    def _sum_sq_diagonals(self, W: Tensor, kmax: int) -> ZeroDimTensor:
-        """sum_{k=-kmax..kmax} ||diag_k(W)||_2^2"""
-        s: ZeroDimTensor = torch.sum(torch.diagonal(W, offset=0).pow(2))
-        for k in range(1, kmax + 1):
-            s = s + torch.sum(torch.diagonal(W, offset=k).pow(2))
-            s = s + torch.sum(torch.diagonal(W, offset=-k).pow(2))
-        return s
-
-    @jaxtyped(typechecker=beartype)
-    @override
-    def forward(self, conv1x1: nn.Conv2d) -> ZeroDimTensor:
-        W: Float[Tensor, "c1 c1"] = conv1x1.weight.squeeze(-1).squeeze(-1)  # (C,C)
-        # (C,C) -> (1)
-        if isinstance(self.eye, Tensor):
-            loss_id: ZeroDimTensor = torch.sum((W - self.eye) ** 2) * self.lam_id
-            frob_2: ZeroDimTensor = torch.sum(W * W)  # Frobenius solution r1 == r2
-            band_energy: ZeroDimTensor = self._sum_sq_diagonals(W, self.band)
-            offband_energy: ZeroDimTensor = frob_2 - band_energy
-            return loss_id + self.off_diag_penalty * offband_energy  # (1)
-        else:
-            raise TypeError(f"self.eye is not tensor: {type(self.eye)=}")
-
-
-# -- Training Functions
-
-type Penalty = IdentityBandedPenalty | LowRankIdentityPenalty
-type SpectralMapper = LinearSpectralMapper | LowRankSpectralMapper
-
-
-def init_linear_map(
-    raw: ArrayF32, prc: ArrayF32, lam_l2: float, model: LinearSpectralMapper
-) -> None:
-    """Warm start a linear mapper via ridge regression solved in numpy space.
-
-    Args:
-        raw: Training spectra prior to preprocessing, shape (N, C).
-        prc: Processed spectra used as the regression targets, shape (n_samples, C).
-        lam_l2: Ridge penalty weight applied to stabilize the linear system.
-    """
-    XT = raw.T  # (n_train, C)
-    a = (XT @ raw) + (lam_l2 * np.eye(raw.shape[1]))
-    b = XT @ prc
-    W0 = np.linalg.solve(a, b)  # (C,C)
-    b0 = prc.mean(axis=0) - (raw.mean(axis=0) @ W0)  # (C,)
-    with torch.no_grad():
-        model.proj.weight.copy_(
-            torch.from_numpy(W0.T).float().unsqueeze(-1).unsqueeze(-1)
-        )
-        model.proj_bias.copy_(torch.from_numpy(b0).float())
-
-
-def get_model(
-    model_type: ModelType,
-    fold_stat: FoldStat,
-    band_penalty: BandPenalty,
-    c_in: int,
-    rank: int,
-    device: torch.device,
-) -> tuple[SpectralMapper, Penalty]:
-    """Instantiate the spectral mapper and its regularizer for the requested model type.
-
-    Args:
-        model_type: Configuration value specifying the mapper architecture.
-        fold_stat: Fold-level statistics used to warm start linear models.
-        c_in: Number of spectral channels available in the input tensors.
-        rank: Rank used for low-rank models (ignored for linear CNN variant).
-        device: Torch device to move the model and penalty onto.
-        band: Half-width of the diagonal band for `IdentityBandedPenalty`.
-        off_diag_penalty: Regularization strength for energy outside the diagonal band.
-        lam_id: Identity penalty weight (also used as ridge prior for warm start).
-
-    Returns:
-        Tuple comprised of the spectral mapper module and an accompanying penalty.
-    """
-    model: SpectralMapper
-    penalty: Penalty
-    match model_type:
-        case ModelType.LSM:
-            model = LinearSpectralMapper(c_in).to(device)
-            # initialize linear map for CNN only
-            init_linear_map(
-                fold_stat.train_raw_z, fold_stat.train_prc_z, band_penalty.id, model
-            )
-            penalty = IdentityBandedPenalty(c_in, band_penalty).to(device)
-        case ModelType.LRSM:
-            model = LowRankSpectralMapper(c_in, rank).to(device)
-            penalty = LowRankIdentityPenalty(band_penalty).to(device)
-    return model, penalty
-
 
 def pick_device() -> torch.device:
     """Select the best available PyTorch device, preferring GPU backends when present.
@@ -457,11 +154,18 @@ def rmse(y_true: Tensor, y_pred: Tensor) -> Tensor:
     return torch.sqrt(torch.mean((y_true - y_pred).pow(2)))
 
 
+@torch.no_grad()
+def cross_entropy(y: Tensor, p: Tensor) -> Tensor:
+    ce = torch.nn.functional.cross_entropy(p, y)
+    return ce
+
+
 def create_dataloader(
     training_data: Dataset[SpectralData],
     test_data: Dataset[SpectralData],
     device: torch.device,
     batch_size: int = 32,
+    num_workers: int = 2,
 ) -> tuple[DataLoader[SpectralData], DataLoader[SpectralData]]:
     """Build train and test dataloaders with convenience logging of sample shapes.
 
@@ -470,6 +174,7 @@ def create_dataloader(
         test_data: Held-out dataset used for validation loss computation.
         device: Torch device used to decide whether to pin loader memory.
         batch_size: Number of samples per stochastic batch.
+        num_workers: Number of parallel workers
 
     Returns:
         Tuple with the training and test dataloaders.
@@ -479,10 +184,12 @@ def create_dataloader(
         training_data,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
     )
-    test_dataloader = DataLoader(test_data, batch_size=1, shuffle=False, num_workers=2)
+    test_dataloader = DataLoader(
+        test_data, batch_size=1, shuffle=False, num_workers=num_workers
+    )
 
     for x, y in test_dataloader:
         logger.debug(f"Shape of spectra [N, C, H, W]: {x.shape}")
@@ -492,25 +199,13 @@ def create_dataloader(
     return (train_dataloader, test_dataloader)
 
 
-def apply_penalty(
-    model: SpectralMapper, penalty: Penalty | None, batch_loss: Tensor
-) -> Tensor:
-    # determine penalty type
-    if penalty is None:
-        return batch_loss
-    elif hasattr(model, "proj"):
-        return get_tensor(batch_loss + penalty(model.proj))
-    else:
-        return get_tensor(batch_loss + penalty(model))
-
-
 def train_epoch(
     dataloader: DataLoader[SpectralData],
     model: SpectralMapper,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    penalty: Penalty | None = None,
+    penalty: Penalty,
 ) -> float:
     """Run a single training epoch and return the average batch loss.
 
@@ -518,7 +213,7 @@ def train_epoch(
         dataloader: Iterator over mini-batches of raw and processed spectra.
         model: Spectral mapper being optimized.
         loss_fn: Criterion measuring reconstruction error in processed space.
-        optimizer: Optimizer compatible with the mapper (AdamW or LBFGS).
+        optimizer: Optimizer compatible with the mapper AdamW.
         device: Device onto which inputs are streamed during the epoch.
         penalty: Optional regularizer applied to the mapper parameters per batch.
 
@@ -528,32 +223,22 @@ def train_epoch(
     model.train()
     total_loss = 0.0
 
-    for spectra, spectra_prc in dataloader:
-        spectra, spectra_prc = (
+    for spectra, target in dataloader:
+        spectra, target = (
             spectra.to(device, non_blocking=True),
-            spectra_prc.to(device, non_blocking=True),
+            target.to(device, non_blocking=True),
         )
         optimizer.zero_grad(set_to_none=True)
         pred = model(spectra)
-        batch_loss = loss_fn(pred, spectra_prc)
-        if isinstance(optimizer, torch.optim.AdamW):
-            batch_loss = apply_penalty(model, penalty, batch_loss)
-            # backpropagation
-            batch_loss.backward()
-            optimizer.step()
-        elif isinstance(optimizer, torch.optim.LBFGS):
+        if isinstance(loss_fn, nn.CrossEntropyLoss):
+            target = target.long()
 
-            def closure() -> Tensor:
-                optimizer.zero_grad()
-                pred = model(spectra.to(device))
-                loss = loss_fn(pred, spectra_prc.to(device))
-                loss = apply_penalty(model, penalty, loss)
-                loss.backward()
-                return loss.detach()
+        batch_loss = loss_fn(pred, target)
+        batch_loss = penalty.apply_penalty(model, batch_loss)
 
-            optimizer.step(closure)
-        else:
-            raise RuntimeError("Failed to find proper optimizer")
+        # backpropagation
+        batch_loss.backward()
+        optimizer.step()
 
         total_loss += float(batch_loss.detach())
     return total_loss / len(dataloader)
@@ -578,29 +263,63 @@ def test_epoch(
         TestResult instance with MSE, RMSE, improvement rate, and predictions.
     """
     model.eval()
-    vl_rmse = vl_mse = total_improv = 0.0
+    vl_loss = total_improv = 0.0
     n_total = 0
     preds_fold = []
-    for spectra, spectra_prc in loader:
-        spectra, spectra_prc = spectra.to(device), spectra_prc.to(device)
+    for spectra, target in loader:
+        spectra, target = spectra.to(device), target.to(device)
         pred = model(spectra)
         preds_fold.append(pred.squeeze(-1).squeeze(-1).cpu().numpy().astype(np.float32))
 
+        if isinstance(loss_fn, nn.CrossEntropyLoss):
+            target = target.long()
+        loss = loss_fn(pred, target)
         # weight loss by batch size
         batches = spectra.shape[0]
-        vl_intermediate_rmse = float(rmse(spectra_prc, pred))
-        vl_mse += float(loss_fn(pred, spectra_prc)) * batches
-        vl_rmse += vl_intermediate_rmse * batches
+        if isinstance(loss_fn, nn.CrossEntropyLoss):
+            true_diff = cross_entropy(target, pred)
+            pred_loss = loss
+        else:
+            true_diff = rmse(target, pred)
+            pred_loss = torch.sqrt(loss)
 
-        total_improv += float((vl_intermediate_rmse < rmse(spectra_prc, spectra)))
+        vl_loss += float(loss) * batches
+        total_improv += float(pred_loss < true_diff)
         n_total += batches
     frac_improved = total_improv / max(1, n_total)
-    vl_mse /= max(1, n_total)
-    vl_rmse /= max(1, n_total)
-    return TestResult(vl_mse, vl_rmse, frac_improved, preds_fold)
+    vl_loss /= max(1, n_total)
+    return TestResult(vl_loss, frac_improved, preds_fold)
 
 
-# -- training function
+# -- main training function
+
+
+def run_epochs(
+    epochs: int,
+    train_dl: DataLoader[SpectralData],
+    test_dl: DataLoader[SpectralData],
+    model: SpectralMapper,
+    loss_fn: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    penalty: Penalty,
+) -> tuple[FoldLoss, list[np.ndarray] | None]:
+    # metrics
+    best_vl_loss, best_preds, fi, tr_loss, vl_loss = float("inf"), None, 0.0, [], []
+    for _ep in range(1, epochs + 1):
+        tr_loss.append(
+            train_epoch(train_dl, model, loss_fn, optimizer, device, penalty)
+        )
+        test_result = test_epoch(test_dl, model, loss_fn, device)
+        fi = test_result.fraction_improved
+
+        vl_loss.append(test_result.test_loss)
+        if test_result.test_loss < best_vl_loss:
+            best_vl_loss = test_result.test_loss
+            best_preds = test_result.predictions
+
+    fold_loss = FoldLoss(np.asarray(tr_loss), np.asarray(vl_loss), fi, best_vl_loss)
+    return fold_loss, best_preds
 
 
 def cv_train_model(
@@ -620,8 +339,6 @@ def cv_train_model(
     """Train the mapper with cross-validation and accumulate out-of-fold diagnostics.
 
     Args:
-        csv_path: Path to annotations or metadata describing the spectra pairs.
-        base_dir: Root directory for locating spectra assets on disk.
         n_splits: Number of cross-validation folds to construct.
         groups: Optional grouping labels controlling the fold assignments.
         batch_size: Mini-batch size fed to the training loop.
@@ -637,9 +354,12 @@ def cv_train_model(
     """
     band_penalty = BandPenalty() if band_penalty is None else band_penalty
     device = pick_device()
-    model_type = model_type if model_type is ModelType else ModelType(model_type)
+    model_type = (
+        model_type if isinstance(model_type, ModelType) else ModelType(model_type)
+    )
     raw = spectral_pairs.X_raw.astype(np.float32)  # (N,C)
     prc = spectral_pairs.Y_proc.astype(np.float32)  # (N,C)
+
     if groups:
         h = w = 8
         group_ints = KFolds.create_groups(h, w)
@@ -667,44 +387,27 @@ def cv_train_model(
             train_ds, test_ds, device, batch_size=batch_size
         )
         c_in = train_ds[0][0].shape[0]
+        c_out = train_ds[0][1].shape[0]
 
         # setup model
         model, penalty = get_model(
             model_type, fold_stat, band_penalty, c_in, rank, device
         )
 
-        loss_fn, optimizer = model.get_loss_managers(lr=lr, wd=wd)
+        loss_fn, optimizer = get_loss_managers(model, lr=lr, wd=wd)
         if fold == 0:
-            c_out = train_ds[0][1].shape[0]
             details = f"model type: {model} | channels in -> channels out: {c_in} -> {c_out}\n"
             details += f"loss function: {loss_fn} | optimizer: {optimizer}\n"
             details += f"Fold option: {type(cv)}"
             logger.debug(details)
 
-        # metrics
-        best_vl_rmse, best_preds, tr_loss_fold, vl_loss_fold = (
-            float("inf"),
-            None,
-            [],
-            [],
+        fold_loss, best_preds = run_epochs(
+            epochs, train_dl, test_dl, model, loss_fn, optimizer, device, penalty
         )
 
-        for ep in range(1, epochs + 1):
-            tr_loss = train_epoch(train_dl, model, loss_fn, optimizer, device, penalty)
-            test_result = test_epoch(test_dl, model, loss_fn, device)
-
-            tr_loss_fold.append(tr_loss)
-            vl_loss_fold.append(test_result.test_rmse)
-            if test_result.test_rmse < best_vl_rmse:
-                best_vl_rmse = test_result.test_rmse
-                best_preds = test_result.predictions
-
-            if verbose and (ep == (epochs)):
-                tqdm.write(
-                    f"Fold {fold + 1}/{total_folds} | train loss={tr_loss:.3g} | "
-                    + f"test MSE={test_result.test_mse:.3g} | best test RMSE={best_vl_rmse:.3g} | "
-                    + f"frac improved vs identity={test_result.fraction_improved:.3f}"
-                )
+        if verbose:
+            out = f"Fold {fold + 1}/{total_folds} |" + fold_loss.repr()
+            tqdm.write(out)
 
         # store metrics
         oof_stats.store(
@@ -713,7 +416,145 @@ def cv_train_model(
             yhat_te_std,
             yhat_te_orig,
             te_idx,
-            FoldLoss(np.asarray(tr_loss_fold), np.asarray(vl_loss_fold)),
+            fold_loss,
         )
 
     return oof_stats
+
+
+# TODO:
+# Molecule Scoring
+
+
+def get_concentration(absorption: np.ndarray, k: np.ndarray):
+    # Regression, we can use least squares to measure concentration:
+    # minimizing function: S = \sum_i=1^n (y_i - f_i)^2
+    # => c = (K^T A) / (K^T K)
+    # with K being the absorbance coefficient & A the light absorption
+    # with variance of:
+    # σ^2 ≈ S/(N-1)
+    numerator = k.T @ absorption
+    denom = np.linalg.inv(k.T @ k)
+    return denom @ numerator
+
+
+@dataclass
+class RegionSet:
+    """Characteristic spectral features in 800–1000 cm⁻¹, 1300–1500 cm⁻¹, and 1500–1800 cm⁻¹"""
+
+    low: float = 900.0
+    mid: float = 1400.0
+    high: float = 1650.0
+    lo_window: tuple[float, float] = field(init=False)
+    mid_window: tuple[float, float] = field(init=False)
+    hi_window: tuple[float, float] = field(init=False)
+    window_range: float | int = 100  # percent: float or absolute measure: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.window_range, float):
+            r1 = self.window_range * self.low
+            r2 = self.window_range * self.mid
+            r3 = self.window_range * self.high
+        else:
+            r1 = self.window_range
+            r2 = self.window_range
+            r3 = self.window_range
+        # prevent negative region, could also add high boundaries
+        self.lo_window = (min(self.low - r1, 0), self.low + r1)
+        self.mid_window = (min(self.mid - r2, 0), self.mid + r2)
+        self.hi_window = (min(self.high - r3, 0), self.high + r3)
+
+    def __iter__(self):
+        yield from [self.lo_window, self.mid_window, self.hi_window]
+
+    def get_low(self) -> tuple[float, float]:
+        return self.lo_window
+
+    def get_mid(self) -> tuple[float, float]:
+        return self.mid_window
+
+    def get_high(self) -> tuple[float, float]:
+        return self.hi_window
+
+    def match(self, sample: float) -> Literal["low", "middle", "high"] | None:
+        """Find if sample is found within expected features, if so, return which feature."""
+        if self.lo_window[0] <= sample and sample <= self.lo_window[1]:
+            return "low"
+        elif self.mid_window[0] <= sample and sample <= self.mid_window[1]:
+            return "middle"
+        elif self.hi_window[0] <= sample and sample <= self.hi_window[1]:
+            return "high"
+        return None
+
+
+def _get_region_area(
+    sample: np.ndarray,
+    reference: np.ndarray,
+    region: tuple[float, float],
+    aggregation: Literal["mean", "median"] = "mean",
+) -> tuple[np.ndarray | np.floating, np.ndarray | np.floating]:
+    r1 = region[0]
+    r2 = region[1]
+    distance = abs(r1 - r2)
+
+    sample_dx = distance / len(sample)
+    ref_dx = distance / len(reference)
+
+    sample_area = sample * sample_dx
+    ref_area = reference * ref_dx
+
+    # take average or median of these values?
+    if aggregation.lower() == "mean":
+        sample_area = np.mean(sample_area)
+        ref_area = np.mean(ref_area)
+    elif aggregation.lower() == "median":
+        sample_area = np.median(sample_area)
+        ref_area = np.median(ref_area)
+    else:
+        NotImplementedError(f"{aggregation=}")
+
+    return sample_area, ref_area
+
+
+def _filter_array(
+    array: np.ndarray, upper_bound: float, lower_bound: float
+) -> np.ndarray:
+    mask = (array >= lower_bound) & (array <= upper_bound)
+    return array[mask]
+
+
+@dataclass
+class PresenceMap:
+    lo: np.ndarray
+    mid: np.ndarray
+    hi: np.ndarray
+
+
+# integrate area or height in small windows around molecule's bands
+# get ratio of the sample vs reference
+# Use some threshold, if the ratio surpasses the threshold it is present
+# This ought be binary at first, but can be probabilistic with more data
+# Regardless, for each pixel, create a map of 1/0 presence of desired molecule
+def create_binary_spectra_map(
+    sample: np.ndarray,
+    reference: np.ndarray,
+    regions: RegionSet,
+    threshold: float = 0.5,
+    aggregation: str = "mean",
+):
+    # TODO: get values of array within each window, ought handle case
+    # where window finds nothing, in such a case, should expand the
+    # window a reasonable amount before raising an exception
+    bool_maps = []
+    for region in regions:
+        # find the area under this curve
+        reference_filtered = _filter_array(reference, *region)
+        sample_filtered = _filter_array(sample, *region)
+        sample_area, ref_area = _get_region_area(
+            sample_filtered, reference_filtered, region
+        )
+
+        ratio = np.asarray(ref_area / sample_area)
+        bool_map = ratio > threshold
+        bool_maps.append(bool_map)
+    return PresenceMap(*bool_maps)
