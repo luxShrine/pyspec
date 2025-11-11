@@ -360,12 +360,11 @@ def cv_train_model(
     raw = spectral_pairs.X_raw.astype(np.float32)  # (N,C)
     prc = spectral_pairs.Y_proc.astype(np.float32)  # (N,C)
 
-    if groups:
-        h = w = 8
-        group_ints = KFolds.create_groups(h, w)
-        cv, split_iter = KFolds(n_splits, raw, group_ints).get_splits()
-    else:
-        cv, split_iter = KFolds(n_splits, raw).get_splits()
+    # TODO: calculate this instead of magic
+    h = w = 8
+
+    kfolds = KFolds(n_splits, raw)
+    cv, split_iter = kfolds.get_splits((h, w))
 
     # out of fold metrics container
     oof_stats = OOFStats(prc_spectra=prc, artifacts=arts)

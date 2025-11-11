@@ -42,28 +42,29 @@ class KFolds:
         self,
         n_splits: int,
         raw_data: ArrayF | ArrayF32,
-        groups: None | Iterable[int] = None,
         random_state: None | int = 42,
     ):
         self.n_splits: int = n_splits
         self.raw: ArrayF | ArrayF32 = raw_data
-        self.groups: None | Iterable[int] = groups
         self.random_state: None | int = 42
 
     def get_splits(
-        self,
+        self, hw: tuple[int, int] | None = None
     ) -> tuple[(KFold | GroupKFold), SplitIter]:
-        if self.groups is None:
+        if hw is not None:
+            h, w = hw[0], hw[1]
+            groups = self._create_groups(h, w)
             cv = KFold(
                 n_splits=self.n_splits, shuffle=True, random_state=self.random_state
             )
         else:
+            groups = None
             cv = GroupKFold(n_splits=self.n_splits)
 
-        return cv, cv.split(self.raw, groups=self.groups)
+        return cv, cv.split(self.raw, groups=groups)
 
     @staticmethod
-    def create_groups(H: int, W: int, tiles_h: int = 2, tiles_w: int = 2):
+    def _create_groups(H: int, W: int, tiles_h: int = 2, tiles_w: int = 2):
         g = np.zeros((H, W), dtype=np.int32)
         for r in range(H):
             for c in range(W):
