@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import binary_erosion, uniform_filter, zoom
 from skimage.filters import threshold_otsu
 from skimage.morphology import reconstruction
-from sklearn.metrics import adjusted_rand_score, auc, jaccard_score, roc_curve
 
-from pyspectral.config import REF_PHE, ArrayF, ArrayF32, Cube, PlotType
+from pyspectral.config import REF_PHE, ArrayF, ArrayF32, PlotType
+from pyspectral.core import Cube
 from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 
 # Binary operations reference:
@@ -25,11 +26,12 @@ from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 class Boundary:
     mask: ArrayF
     mask_type: str
+    boundary: ArrayF = field(init=False)
 
     def __post_init__(self) -> None:
         """Create thin boundary of a binary mask."""
         er = binary_erosion(self.mask, structure=np.ones((3, 3), bool))
-        self.boundary: ArrayF = self.mask ^ er  # type: ignore
+        self.boundary = self.mask ^ er  # pyright: ignore[reportOperatorIssue]
 
     @classmethod
     def create_hysteresis_mask(
@@ -100,7 +102,7 @@ def safe_den_center(
     *,
     fallback: float = REF_PHE,
     atol: float = 1.0,
-):
+) -> float:
     ref = stats.num_center
     if abs(den_center - ref) <= atol:
         return fallback
@@ -158,16 +160,17 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
     boundary_raw = Boundary.create_hysteresis_mask(r_raw)
     boundary_proc = Boundary.create_hysteresis_mask(r_proc)
     boundary_pred = Boundary.create_hysteresis_mask(r_pred)
-    prc_pred_boundary_xor = boundary_proc.boundary ^ boundary_pred.boundary  # type: ignore
-    raw_pred_boundary_xor = boundary_raw.boundary ^ boundary_pred.boundary  # type: ignore
-    rp_boundary_xor = boundary_raw.boundary ^ boundary_proc.boundary  # type: ignore
+
+    prc_pred_boundary_xor = boundary_proc.boundary ^ boundary_pred.boundary  # pyright: ignore[reportOperatorIssue]
+    raw_pred_boundary_xor = boundary_raw.boundary ^ boundary_pred.boundary  # pyright: ignore[reportOperatorIssue]
+    rp_boundary_xor = boundary_raw.boundary ^ boundary_proc.boundary  # pyright: ignore[reportOperatorIssue]
 
     # per-pixel RMSE, across bands
     prc_pred_rmse_map = rmse_per_pixel(plot_data.proc_cube, plot_data.pred_cube)
     raw_pred_rmse_map = rmse_per_pixel(plot_data.raw_cube, plot_data.pred_cube)
     rp_rmse_map = rmse_per_pixel(plot_data.raw_cube, plot_data.proc_cube)
 
-    metrics = {}
+    metrics: dict[str, float] = {}
 
     # figure
     scale = 20 if up else 1
