@@ -18,7 +18,8 @@ from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 
 
 def _get_figure_size(number_plots: int) -> tuple[int, int]:
-    """Returns number of rows, by number of columns."""
+    """Returns number of rows, by number of columns, for use in conjunnction
+    with matplotlib's subplots."""
     MAX_COLUMNS_PER_LINE = 4
     if number_plots <= MAX_COLUMNS_PER_LINE:
         # fits all on one row
