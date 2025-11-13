@@ -14,12 +14,32 @@ from pyspectral.config import REF_PHE, ArrayF, ArrayF32, PlotType
 from pyspectral.core import Cube
 from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
 
-# Binary operations reference:
-# x ^ y ; set each bit to 1 if only one of the bits are 1
-# x | y ; set each bit to 1 if one of the bits are 1
+# -- figure count helper
+
+
+def _get_figure_size(number_plots: int) -> tuple[int, int]:
+    """Returns number of rows, by number of columns."""
+    MAX_COLUMNS_PER_LINE = 4
+    if number_plots <= MAX_COLUMNS_PER_LINE:
+        # fits all on one row
+        return 1, number_plots
+
+    near_max_col = max(1, MAX_COLUMNS_PER_LINE - 1)
+    if (number_plots % near_max_col) == 0:
+        # fits an even amount minus one of max
+        rows = int(number_plots / near_max_col)
+        return rows, near_max_col
+
+    # if above checks fail, just return sensible default, round up
+    rows = (number_plots / MAX_COLUMNS_PER_LINE).__ceil__()
+    return rows, MAX_COLUMNS_PER_LINE
 
 
 # -- Boundary
+
+# Binary operations reference:
+# x ^ y ; set each bit to 1 if only one of the bits are 1
+# x | y ; set each bit to 1 if one of the bits are 1
 
 
 @dataclass
@@ -120,9 +140,7 @@ def rmse_per_pixel(cube_a: Cube | ArrayF32, cube_b: Cube | ArrayF32) -> ArrayF32
     return np.sqrt(((cube_a - cube_b) ** 2).mean(axis=-1, dtype=np.float32))  # type: ignore
 
 
-def overlay_boundary(
-    base_img: ArrayF, boundary: ArrayF, title: str, ax: plt.Axes, alpha: float = 0.9
-) -> None:
+def overlay_boundary(base_img: ArrayF, boundary: ArrayF, title: str, ax: Axes) -> None:
     """
     Overlay boundary over base image.
     base_img: (H,W) float image to show (ratio or mean intensity)
@@ -202,16 +220,19 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
         (upscale(rp_rmse_map), None, "Raw-Processed Per-pixel RMSE"),
         (upscale(raw_pred_rmse_map), None, "Raw-Pred Per-pixel RMSE"),
     ]
+
     n = len(imgs)
-    # TODO: make this figure 2 rows
-    _fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 4))
-    for ax, (base, edge, title) in zip(np.atleast_1d(axes), imgs):
+    r, c = _get_figure_size(n)
+    figsize = (4.2 * n, 4)
+    _fig, axes = plt.subplots(r, c, dpi=200)
+    axes: list[Axes] = np.atleast_1d(axes).flatten().tolist()
+    for ax, (base, edge, title) in zip(axes, imgs):
         ax.imshow(base, cmap="gray")
         if edge is not None:
             overlay = np.zeros((*edge.shape, 4), float)
             overlay[edge] = (1, 0, 0, 0.9)
             ax.imshow(overlay)
-        ax.set_title(title)
+        ax.set_title(title, {"fontsize": 8}, loc="center", wrap=True)
         ax.set_axis_off()
 
     plt.tight_layout()
@@ -220,7 +241,14 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
     return metrics
 
 
-def filter_plot_type(plot_type: PlotType, fp_data: list[FoldPlot]):
+type FilteredPlotDataTest = list[tuple[None, ArrayF, str]]
+type FilteredPlotDataTrain = list[tuple[ArrayF, None, str]]
+type FilteredPlotDataAll = list[tuple[ArrayF, ArrayF, str]]
+
+
+def filter_plot_type(
+    plot_type: PlotType, fp_data: list[FoldPlot]
+) -> FilteredPlotDataTest | FilteredPlotDataTrain | FilteredPlotDataAll:
     threshold = 10  # remove plots greater than some threshold
     match plot_type:
         case PlotType.TEST:
@@ -236,7 +264,7 @@ def filter_plot_type(plot_type: PlotType, fp_data: list[FoldPlot]):
 
 
 def _plot_classic_line(
-    ax: plt.Axes, elasticnet_rmse: float, pcr_rmse: float, epochs: int
+    ax: Axes, elasticnet_rmse: float, pcr_rmse: float, epochs: int
 ) -> None:
     """Add horizontal line for PCR/ElasticNet."""
     ax.hlines(
