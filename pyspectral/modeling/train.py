@@ -1,5 +1,7 @@
+from __future__ import annotations
+
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
 
 from loguru import logger
 import numpy as np
@@ -8,27 +10,36 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from pyspectral.config import ArrayF, ArrayF32, ModelType
-from pyspectral.dataset import (
+from pyspectral.config import (
+    ArrayF,
+    ArrayF32,
+    ArrayI,
+    ClassModelType,
     IndexArray,
+    SpecModelType,
+)
+from pyspectral.data.dataset import (
     KFolds,
     PixelSpectraDataset,
-    SpectralData,
-    SpectraPair,
+    build_scene_datasets,
+    build_spec_datasets,
+    scene_collate,
 )
-from pyspectral.features import DataArtifacts, FoldStat
+from pyspectral.data.features import FoldStat, RegionSet
+from pyspectral.data.io import ClassPair, DataArtifacts, SpectraPair
 from pyspectral.modeling.models import (
     BandPenalty,
+    ClassCfg,
+    MILMeanHead,
+    Model,
     Penalty,
-    SpectralMapper,
-    get_loss_managers,
-    get_model,
+    SpectraCfg,
+    get_train_setup,
 )
 
 
 @dataclass(frozen=True, slots=True)
 class TestResult:
-    # BUG: not always using rmse, correct downstream use of this RMSE value
     test_loss: float
     fraction_improved: float
     predictions: list[ArrayF32]
@@ -49,8 +60,8 @@ class FoldLoss:
 
     def repr(self) -> str:
         out = (
-            f"train loss={self.train:.3g} | "
-            + f"test loss={self.test:.3g} | "
+            f"train loss={self.train.mean():.3g} | "
+            + f"test loss={self.test.mean():.3g} | "
             + f"best test loss={self.best_test:.3g} | "
             + f"frac improved vs identity={self.frac_improved:.3f}"
         )
@@ -82,8 +93,9 @@ class EpochLosses:
 class OOFStats:
     """Store per fold stats."""
 
-    def __init__(self, prc_spectra: ArrayF32, artifacts: DataArtifacts):
+    def __init__(self, prc_spectra: ArrayF32 | ArrayF, artifacts: DataArtifacts):
         # all shapes are the same: (N,C)
+        prc_spectra = prc_spectra.astype(np.float32, copy=False)
         self.pred_std: ArrayF32 = np.zeros_like(prc_spectra)
         self.true_std: ArrayF32 = np.zeros_like(prc_spectra)
         self.diag_std: ArrayF32 = np.zeros_like(prc_spectra)
@@ -102,8 +114,6 @@ class OOFStats:
         self,
         fold_stat: FoldStat,
         best_preds_fold: list[ArrayF32] | None,
-        yhat_te_std: ArrayF,
-        yhat_te_orig: ArrayF,
         test_idx: IndexArray,
         fold_epoch_loss: FoldLoss,
     ) -> None:
@@ -115,13 +125,61 @@ class OOFStats:
         preds_fold = np.concatenate(best_preds_fold, axis=0)
         self.pred_std[test_idx] = preds_fold
         self.true_std[test_idx] = fold_stat.test_prc_z
-        self.diag_std[test_idx] = yhat_te_std
         # inverse transform to original Y units: y = y_std*sd + mu
         y_pred_orig = preds_fold * fold_stat.y_std + fold_stat.y_mean
         self.pred_orig[test_idx] = y_pred_orig
-        self.diag_orig[test_idx] = yhat_te_orig
 
         self.epoch_loss.append(fold_epoch_loss)
+
+    def get_loss(self) -> EpochLosses:
+        return EpochLosses(_fold_loss_store=self.epoch_loss)
+
+
+class ClassOOFStats:
+    """Per-scene diagnostics for classification cross-validation."""
+
+    def __init__(self, artifacts: DataArtifacts):
+        self.artifacts: DataArtifacts = artifacts
+        self.scene_ids: ArrayI = np.asarray(artifacts.scene_ids, dtype=np.int64)
+        # binary presence labels stored for convenience
+        self.true: ArrayF32 = np.asarray(artifacts.presences, dtype=np.float32).reshape(
+            -1, 1
+        )
+        self.pred: ArrayF32 | None = None
+        self.epoch_loss: list[FoldLoss] = []
+
+    def _ensure_storage(self, pred_dim: int) -> None:
+        if self.pred is None:
+            n_scenes = self.scene_ids.size
+            self.pred = np.zeros((n_scenes, pred_dim), dtype=np.float32)
+
+    def store(
+        self,
+        scene_indices: IndexArray,
+        best_preds_fold: list[ArrayF32] | None,
+        fold_loss: FoldLoss,
+    ) -> None:
+        if best_preds_fold is None:
+            raise RuntimeError(
+                "best_preds_fold is None; did the classification fold run evaluation?"
+            )
+        preds = np.concatenate(best_preds_fold, axis=0).astype(np.float32, copy=False)
+        if preds.ndim == 1:
+            preds = preds[:, None]
+        elif preds.ndim > 2:
+            preds = preds.reshape(preds.shape[0], -1)
+
+        scene_indices = np.asarray(scene_indices, dtype=np.int64)
+        if preds.shape[0] != scene_indices.size:
+            raise ValueError(
+                "Prediction count mismatch "
+                + f"(preds={preds.shape[0]} vs scenes={scene_indices.size})."
+            )
+
+        self._ensure_storage(preds.shape[1] if preds.ndim > 1 else 1)
+        assert self.pred is not None  # for type checker
+        self.pred[scene_indices] = preds
+        self.epoch_loss.append(fold_loss)
 
     def get_loss(self) -> EpochLosses:
         return EpochLosses(_fold_loss_store=self.epoch_loss)
@@ -161,12 +219,13 @@ def cross_entropy(y: Tensor, p: Tensor) -> Tensor:
 
 
 def create_dataloader(
-    training_data: Dataset[SpectralData],
-    test_data: Dataset[SpectralData],
+    training_data: Dataset,
+    test_data: Dataset,
     device: torch.device,
     batch_size: int = 32,
     num_workers: int = 2,
-) -> tuple[DataLoader[SpectralData], DataLoader[SpectralData]]:
+    collate_fn: Callable | None = None,
+) -> tuple[DataLoader, DataLoader]:
     """Build train and test dataloaders with convenience logging of sample shapes.
 
     Args:
@@ -177,7 +236,8 @@ def create_dataloader(
         num_workers: Number of parallel workers
 
     Returns:
-        Tuple with the training and test dataloaders.
+        Tuple with the training and test dataloaders. When ``collate_fn`` is supplied
+        it is forwarded to both loaders (used for variable-length batches).
     """
     # Create data loaders.
     train_dataloader = DataLoader(
@@ -186,22 +246,67 @@ def create_dataloader(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=(device.type == "cuda"),
+        collate_fn=collate_fn,
     )
     test_dataloader = DataLoader(
-        test_data, batch_size=1, shuffle=False, num_workers=num_workers
+        test_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
     )
 
-    for x, y in test_dataloader:
-        logger.debug(f"Shape of spectra [N, C, H, W]: {x.shape}")
-        logger.debug(f"Shape of processed spectra: {y.shape} {y.dtype}")
+    for batch in test_dataloader:
+        logger.debug(f"Shape of raw data: {batch[0].shape}")
+        logger.debug(f"Shape of processed data: {batch[1].shape} {batch[1].dtype}")
         break
 
     return (train_dataloader, test_dataloader)
 
 
+def _prediction_from_output(output: nn.Module | Tensor | tuple | list) -> Tensor:
+    """Unpack model outputs, returning the tensor used for loss/pred storage."""
+    if isinstance(output, Tensor):
+        return output
+    if isinstance(output, (tuple, list)):
+        first = output[0]
+        if isinstance(first, Tensor):
+            return first
+    raise TypeError(f"Unsupported model output type: {type(output)}")
+
+
+def _pred_to_numpy(pred: Tensor) -> ArrayF32:
+    arr = pred.detach().cpu().numpy().astype(np.float32, copy=False)
+    while arr.ndim > 1 and arr.shape[-1] == 1:
+        arr = arr.squeeze(-1)
+    return arr
+
+
+def _prepare_batch(
+    batch: tuple | list,
+    device: torch.device,
+    model: Model,
+) -> tuple[tuple[Tensor, ...], Tensor, torch.Tensor | None]:
+    if len(batch) == 2:
+        spectra, target = batch
+        inputs = (spectra.to(device, non_blocking=True),)
+        return inputs, target.to(device, non_blocking=True), None
+    if len(batch) == 4:
+        feats, mask, target, scene_idx = batch
+        feats = feats.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        if isinstance(model, MILMeanHead):
+            inputs = (feats, mask)
+        else:
+            inputs = (feats,)
+        return inputs, target, scene_idx
+    raise TypeError(f"Unsupported batch structure of length {len(batch)}")
+
+
 def train_epoch(
-    dataloader: DataLoader[SpectralData],
-    model: SpectralMapper,
+    dataloader: DataLoader,
+    model: Model,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -223,13 +328,10 @@ def train_epoch(
     model.train()
     total_loss = 0.0
 
-    for spectra, target in dataloader:
-        spectra, target = (
-            spectra.to(device, non_blocking=True),
-            target.to(device, non_blocking=True),
-        )
+    for batch in dataloader:
+        inputs, target, _ = _prepare_batch(batch, device, model)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(spectra)
+        pred = _prediction_from_output(model(*inputs))
         if isinstance(loss_fn, nn.CrossEntropyLoss):
             target = target.long()
 
@@ -246,8 +348,8 @@ def train_epoch(
 
 @torch.no_grad()
 def test_epoch(
-    loader: DataLoader[SpectralData],
-    model: nn.Module,
+    loader: DataLoader,
+    model: Model,
     loss_fn: nn.Module,
     device: torch.device,
 ) -> TestResult:
@@ -266,16 +368,16 @@ def test_epoch(
     vl_loss = total_improv = 0.0
     n_total = 0
     preds_fold = []
-    for spectra, target in loader:
-        spectra, target = spectra.to(device), target.to(device)
-        pred = model(spectra)
-        preds_fold.append(pred.squeeze(-1).squeeze(-1).cpu().numpy().astype(np.float32))
+    for batch in loader:
+        inputs, target, _ = _prepare_batch(batch, device, model)
+        pred = _prediction_from_output(model(*inputs))
+        preds_fold.append(_pred_to_numpy(pred))
 
         if isinstance(loss_fn, nn.CrossEntropyLoss):
             target = target.long()
         loss = loss_fn(pred, target)
         # weight loss by batch size
-        batches = spectra.shape[0]
+        batches = int(target.shape[0]) if target.ndim >= 1 else 1
         if isinstance(loss_fn, nn.CrossEntropyLoss):
             true_diff = cross_entropy(target, pred)
             pred_loss = loss
@@ -296,9 +398,9 @@ def test_epoch(
 
 def run_epochs(
     epochs: int,
-    train_dl: DataLoader[SpectralData],
-    test_dl: DataLoader[SpectralData],
-    model: SpectralMapper,
+    train_dl: DataLoader,
+    test_dl: DataLoader,
+    model: Model,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -330,17 +432,15 @@ def cv_train_model(
     epochs: int = 20,
     lr: float = 2e-4,
     wd: float = 1e-4,
-    model_type: str | ModelType = ModelType.LRSM,
+    model_type: str | SpecModelType = SpecModelType.LRSM,
     rank: int = 8,
     band_penalty: BandPenalty | None = None,
-    groups: bool = True,
     verbose: bool = False,
 ) -> OOFStats:
     """Train the mapper with cross-validation and accumulate out-of-fold diagnostics.
 
     Args:
         n_splits: Number of cross-validation folds to construct.
-        groups: Optional grouping labels controlling the fold assignments.
         batch_size: Mini-batch size fed to the training loop.
         epochs: Number of training epochs per fold.
         lr: Learning rate supplied to the optimizer factory.
@@ -355,33 +455,20 @@ def cv_train_model(
     band_penalty = BandPenalty() if band_penalty is None else band_penalty
     device = pick_device()
     model_type = (
-        model_type if isinstance(model_type, ModelType) else ModelType(model_type)
+        model_type
+        if isinstance(model_type, SpecModelType)
+        else SpecModelType(model_type)
     )
-    raw = spectral_pairs.X_raw.astype(np.float32)  # (N,C)
-    prc = spectral_pairs.Y_proc.astype(np.float32)  # (N,C)
-
-    # TODO: calculate this instead of magic
-    h = w = 8
-
-    kfolds = KFolds(n_splits, raw)
-    cv, split_iter = kfolds.get_splits((h, w))
 
     # out of fold metrics container
-    oof_stats = OOFStats(prc_spectra=prc, artifacts=arts)
+    oof_stats = OOFStats(prc_spectra=spectral_pairs.Y_proc, artifacts=arts)
 
-    total_folds = cv.get_n_splits()
-    for fold, (tr_idx, te_idx) in tqdm(enumerate(split_iter), total=total_folds):
-        # take out the sections of the arrays by index & normalize around average
-        fold_stat = FoldStat.from_subset(
-            raw[tr_idx], prc[tr_idx], raw[te_idx], prc[te_idx]
-        )
+    for fold, (tr_dsi, te_dsi, fold_stat) in tqdm(
+        enumerate(build_spec_datasets(n_splits, spectral_pairs, arts))
+    ):
+        train_ds, _ = tr_dsi
+        test_ds, te_idx = te_dsi
 
-        # create baseline to compare to.
-        yhat_te_std, yhat_te_orig = fold_stat.get_baseline()
-
-        # must recreate model, datasets & loaders each fold
-        train_ds = PixelSpectraDataset(fold_stat.train_raw_z, fold_stat.train_prc_z)
-        test_ds = PixelSpectraDataset(fold_stat.test_raw_z, fold_stat.test_prc_z)
         train_dl, test_dl = create_dataloader(
             train_ds, test_ds, device, batch_size=batch_size
         )
@@ -389,31 +476,33 @@ def cv_train_model(
         c_out = train_ds[0][1].shape[0]
 
         # setup model
-        model, penalty = get_model(
-            model_type, fold_stat, band_penalty, c_in, rank, device
-        )
+        cfg = SpectraCfg(fold_stat, model_type, band_penalty=band_penalty, rank=rank)
+        train_setup = get_train_setup(c_in, device, lr=lr, wd=wd, goal=cfg)
 
-        loss_fn, optimizer = get_loss_managers(model, lr=lr, wd=wd)
         if fold == 0:
-            details = f"model type: {model} | channels in -> channels out: {c_in} -> {c_out}\n"
-            details += f"loss function: {loss_fn} | optimizer: {optimizer}\n"
-            details += f"Fold option: {type(cv)}"
+            details = f"model type: {train_setup.model} | channels in -> channels out: {c_in} -> {c_out}\n"
+            details += f"loss function: {train_setup.loss_fn} | optimizer: {train_setup.optimizer}\n"
             logger.debug(details)
 
         fold_loss, best_preds = run_epochs(
-            epochs, train_dl, test_dl, model, loss_fn, optimizer, device, penalty
+            epochs,
+            train_dl,
+            test_dl,
+            train_setup.model,
+            train_setup.loss_fn,
+            train_setup.optimizer,
+            device,
+            train_setup.penalty,
         )
 
         if verbose:
-            out = f"Fold {fold + 1}/{total_folds} |" + fold_loss.repr()
+            out = f"Fold {fold + 1}/{n_splits} |" + fold_loss.repr()
             tqdm.write(out)
 
         # store metrics
         oof_stats.store(
             fold_stat,
             best_preds,
-            yhat_te_std,
-            yhat_te_orig,
             te_idx,
             fold_loss,
         )
@@ -421,139 +510,74 @@ def cv_train_model(
     return oof_stats
 
 
-# TODO:
-# Molecule Scoring
+def train_class(
+    class_pair: ClassPair,
+    n_splits: int = 4,
+    batch_size: int = 2,
+    epochs: int = 20,
+    lr: float = 2e-4,
+    wd: float = 1e-4,
+    verbose: bool = False,
+) -> ClassOOFStats:
+    """
+    Args:
+        n_splits: Number of cross-validation folds to construct.
+        batch_size: Mini-batch size fed to the training loop.
+        epochs: Number of training epochs per fold.
+        lr: Learning rate supplied to the optimizer factory.
+        wd: Weight decay applied when using AdamW.
+        verbose: Whether to stream fold-level diagnostics to stdout.
 
+    Returns:
+        Aggregated out-of-fold statistics capturing losses and predictions.
+    """
+    device = pick_device()
 
-def get_concentration(absorption: np.ndarray, k: np.ndarray):
-    # Regression, we can use least squares to measure concentration:
-    # minimizing function: S = \sum_i=1^n (y_i - f_i)^2
-    # => c = (K^T A) / (K^T K)
-    # with K being the absorbance coefficient & A the light absorption
-    # with variance of:
-    # σ^2 ≈ S/(N-1)
-    numerator = k.T @ absorption
-    denom = np.linalg.inv(k.T @ k)
-    return denom @ numerator
+    # TODO: calculate this instead of magic
+    h = w = 8
+    ppt = int(h / 2)
 
+    region_set = RegionSet()
+    oof_stats = ClassOOFStats(class_pair.arts)
 
-@dataclass
-class RegionSet:
-    """Characteristic spectral features in 800–1000 cm⁻¹, 1300–1500 cm⁻¹, and 1500–1800 cm⁻¹"""
+    for fold, (tr_dsi, te_dsi, _) in tqdm(
+        enumerate(build_scene_datasets(n_splits, class_pair, region_set))
+    ):
+        tr_ds, _ = tr_dsi
+        te_ds, te_i = te_dsi
 
-    low: float = 900.0
-    mid: float = 1400.0
-    high: float = 1650.0
-    lo_window: tuple[float, float] = field(init=False)
-    mid_window: tuple[float, float] = field(init=False)
-    hi_window: tuple[float, float] = field(init=False)
-    window_range: float | int = 100  # percent: float or absolute measure: int
+        # must recreate model, datasets & loaders each fold
+        train_dl, test_dl = create_dataloader(
+            tr_ds, te_ds, device, batch_size, collate_fn=scene_collate
+        )
+        c_in = tr_ds[0][0].shape[0]
+        # c_out = tr_ds[0][1].shape[0]
 
-    def __post_init__(self) -> None:
-        if isinstance(self.window_range, float):
-            r1 = self.window_range * self.low
-            r2 = self.window_range * self.mid
-            r3 = self.window_range * self.high
-        else:
-            r1 = self.window_range
-            r2 = self.window_range
-            r3 = self.window_range
-        # prevent negative region, could also add high boundaries
-        self.lo_window = (min(self.low - r1, 0), self.low + r1)
-        self.mid_window = (min(self.mid - r2, 0), self.mid + r2)
-        self.hi_window = (min(self.high - r3, 0), self.high + r3)
+        # setup model
+        cfg = ClassCfg(h, w, ClassModelType.MIL)
+        train_setup = get_train_setup(c_in, device, lr=lr, wd=wd, goal=cfg)
 
-    def __iter__(self):
-        yield from [self.lo_window, self.mid_window, self.hi_window]
+        if fold == 0:
+            details = f"model type: {train_setup.model} \n"
+            details += f"loss function: {train_setup.loss_fn} | optimizer: {train_setup.optimizer}\n"
+            logger.debug(details)
 
-    def get_low(self) -> tuple[float, float]:
-        return self.lo_window
-
-    def get_mid(self) -> tuple[float, float]:
-        return self.mid_window
-
-    def get_high(self) -> tuple[float, float]:
-        return self.hi_window
-
-    def match(self, sample: float) -> Literal["low", "middle", "high"] | None:
-        """Find if sample is found within expected features, if so, return which feature."""
-        if self.lo_window[0] <= sample and sample <= self.lo_window[1]:
-            return "low"
-        elif self.mid_window[0] <= sample and sample <= self.mid_window[1]:
-            return "middle"
-        elif self.hi_window[0] <= sample and sample <= self.hi_window[1]:
-            return "high"
-        return None
-
-
-def _get_region_area(
-    sample: np.ndarray,
-    reference: np.ndarray,
-    region: tuple[float, float],
-    aggregation: Literal["mean", "median"] = "mean",
-) -> tuple[np.ndarray | np.floating, np.ndarray | np.floating]:
-    r1 = region[0]
-    r2 = region[1]
-    distance = abs(r1 - r2)
-
-    sample_dx = distance / len(sample)
-    ref_dx = distance / len(reference)
-
-    sample_area = sample * sample_dx
-    ref_area = reference * ref_dx
-
-    # take average or median of these values?
-    if aggregation.lower() == "mean":
-        sample_area = np.mean(sample_area)
-        ref_area = np.mean(ref_area)
-    elif aggregation.lower() == "median":
-        sample_area = np.median(sample_area)
-        ref_area = np.median(ref_area)
-    else:
-        NotImplementedError(f"{aggregation=}")
-
-    return sample_area, ref_area
-
-
-def _filter_array(
-    array: np.ndarray, upper_bound: float, lower_bound: float
-) -> np.ndarray:
-    mask = (array >= lower_bound) & (array <= upper_bound)
-    return array[mask]
-
-
-@dataclass
-class PresenceMap:
-    lo: np.ndarray
-    mid: np.ndarray
-    hi: np.ndarray
-
-
-# integrate area or height in small windows around molecule's bands
-# get ratio of the sample vs reference
-# Use some threshold, if the ratio surpasses the threshold it is present
-# This ought be binary at first, but can be probabilistic with more data
-# Regardless, for each pixel, create a map of 1/0 presence of desired molecule
-def create_binary_spectra_map(
-    sample: np.ndarray,
-    reference: np.ndarray,
-    regions: RegionSet,
-    threshold: float = 0.5,
-    aggregation: str = "mean",
-):
-    # TODO: get values of array within each window, ought handle case
-    # where window finds nothing, in such a case, should expand the
-    # window a reasonable amount before raising an exception
-    bool_maps = []
-    for region in regions:
-        # find the area under this curve
-        reference_filtered = _filter_array(reference, *region)
-        sample_filtered = _filter_array(sample, *region)
-        sample_area, ref_area = _get_region_area(
-            sample_filtered, reference_filtered, region
+        fold_loss, best_preds = run_epochs(
+            epochs,
+            train_dl,
+            test_dl,
+            train_setup.model,
+            train_setup.loss_fn,
+            train_setup.optimizer,
+            device,
+            train_setup.penalty,
         )
 
-        ratio = np.asarray(ref_area / sample_area)
-        bool_map = ratio > threshold
-        bool_maps.append(bool_map)
-    return PresenceMap(*bool_maps)
+        if verbose:
+            out = f"Fold {fold + 1} |" + fold_loss.repr()
+            tqdm.write(out)
+
+        # store metrics for held-out scenes
+        oof_stats.store(te_i, best_preds, fold_loss)
+
+    return oof_stats
