@@ -1,14 +1,14 @@
-from dataclasses import dataclass, field
-from typing import Any, Literal, override
+from dataclasses import dataclass
+from typing import Any, override
 
 from beartype import beartype
-from jaxtyping import Float, jaxtyped
+from jaxtyping import Bool, Float, jaxtyped
 import numpy as np
 import torch
 from torch import Tensor, nn
 
-from pyspectral.config import ArrayF32, ModelType
-from pyspectral.features import FoldStat
+from pyspectral.config import ArrayF32, ClassModelType, SpecModelType
+from pyspectral.data.features import FoldStat
 
 
 def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
@@ -20,10 +20,42 @@ def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
 
 
 # tensor dimension checks
-type BatchTensor = Float[Tensor, "B c1 H W"]
+type BatchTensor = Float[Tensor, "B C"]
 type ClassTensor = Float[Tensor, "B F"]
 type OneDimTensor = Float[Tensor, "1"]
 type ZeroDimTensor = Float[Tensor, ""]
+
+type FeatTensor = Float[Tensor, "B T D"]
+type MaskTensor = Bool[Tensor, "B T"]
+
+# -- multiple-instance learning model
+
+
+class MILMeanHead(nn.Module):
+    def __init__(self, c_in: int, hidden: int = 64):
+        super().__init__()
+        self.net: nn.Sequential = nn.Sequential(
+            nn.LayerNorm(c_in),
+            nn.Linear(c_in, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),  # per-pixel logit
+        )
+
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(self, X: FeatTensor, mask: MaskTensor):
+        """
+        Args:
+            X: (B,T,D)
+            mask: (B,T)
+        """
+
+        z = self.net(X).squeeze(-1)  # (B,T)
+        p = torch.sigmoid(z)
+        # masked mean pooling -> map probability
+        denom = mask.float().sum(dim=1).clamp_min(1.0)
+        prob = (p * mask).sum(dim=1) / denom  # (B,)
+        return prob, z, p
 
 
 # -- conv model
@@ -84,6 +116,7 @@ class ConvSpectralClassifier(nn.Module):
         return y
 
 
+type ClassMapper = ConvSpectralClassifier | MILMeanHead
 # -- Low Rank, less complexity less memory
 
 
@@ -103,29 +136,27 @@ class LowRankSpectralMapper(nn.Module):
     @override
     def forward(self, x: BatchTensor) -> BatchTensor:
         """
-        (B, C, H, W)         -> returns (B, C, H, W)
+        (B, C) -> returns (B, C)
         """
-        B, C = x.shape[:2]
-        x_flat: Float[Tensor, "batch c1"] = x.view(B, C)
         # sanity check channel dimension
-        if x_flat.shape[1] != self.V.shape[0]:
+        if x.shape[1] != self.V.shape[0]:
             raise RuntimeError(
-                f"Channel mismatch: x has C={x.shape[1]} but mapper was built with C={self.V.shape[0]}"
+                f"Channel mismatch: x has C={x.shape[1]} but mapper was "
+                + f"built with C={self.V.shape[0]}"
             )
 
         # (B,C) @ (C,r) -> (B,r) -> (B,C)
-        corr: Float[Tensor, "batch r"] = (x_flat @ self.V) @ self.U.t()
+        xcorr: Float[Tensor, "B r"] = x @ self.V
+        corr: Float[Tensor, "B u"] = xcorr @ self.U.t()
         # broadcast bias (C,)
-        y_flat: Float[Tensor, "batch c1"] = x_flat + corr + self.bias
-        y: BatchTensor = y_flat.unsqueeze(-1).unsqueeze(-1)
-
-        return y
+        y_flat: Float[Tensor, "B u 1 1"] = x + corr + self.bias
+        return y_flat.squeeze(-1).squeeze(-1)
 
 
 class LowRankIdentityPenalty(nn.Module):
-    """λ * (||U||_F^2 + ||V||_F^2). Optionally, bias L2, too."""
+    """λ * (||U||_F^2 + ||V||_F^2)."""
 
-    def __init__(self, lam_id, bias):
+    def __init__(self, lam_id: float, bias: float):
         super().__init__()
         self.lam_id: float = lam_id
         self.lam_bias: float = bias
@@ -166,10 +197,32 @@ class LinearSpectralMapper(nn.Module):
         return get_tensor(self.proj(x))
 
 
+def init_linear_map(
+    raw: ArrayF32, prc: ArrayF32, lam_l2: float, model: LinearSpectralMapper
+) -> None:
+    """Warm start a linear mapper via ridge regression solved in numpy space.
+
+    Args:
+        raw: Training spectra prior to preprocessing, shape (N, C).
+        prc: Processed spectra used as the regression targets, shape (n_samples, C).
+        lam_l2: Ridge penalty weight applied to stabilize the linear system.
+    """
+    XT = raw.T  # (n_train, C)
+    a = (XT @ raw) + (lam_l2 * np.eye(raw.shape[1]))
+    b = XT @ prc
+    W0 = np.linalg.solve(a, b)  # (C,C)
+    b0 = prc.mean(axis=0) - (raw.mean(axis=0) @ W0)  # (C,)
+    with torch.no_grad():
+        model.proj.weight.copy_(
+            torch.from_numpy(W0.T).float().unsqueeze(-1).unsqueeze(-1)
+        )
+        model.proj_bias.copy_(torch.from_numpy(b0).float())
+
+
 class IdentityBandedPenalty(nn.Module):
     """λ||W−I||_F^2 on full matrix + μ * energy outside a ±band around diagonal"""
 
-    def __init__(self, c: int, band, lam_id, off_diag_penalty):
+    def __init__(self, c: int, band: int, lam_id: float, off_diag_penalty: float):
         super().__init__()
         self.register_buffer("eye", torch.eye(c))  # (C,C)
         self.band: int = band
@@ -200,6 +253,7 @@ class IdentityBandedPenalty(nn.Module):
 
 
 type SpectralMapper = LinearSpectralMapper | LowRankSpectralMapper
+type Model = SpectralMapper | ClassMapper
 
 # -- penalties
 
@@ -230,7 +284,7 @@ class BandPenalty:
 class Penalty:
     _penalty: None | IdentityBandedPenalty | LowRankIdentityPenalty
 
-    def apply_penalty(self, model: SpectralMapper, batch_loss: Tensor) -> Tensor:
+    def apply_penalty(self, model: Model, batch_loss: Tensor) -> Tensor:
         # determine penalty type
         if self._penalty is None:
             return batch_loss
@@ -243,63 +297,70 @@ class Penalty:
 # -- Training Functions
 
 
-def init_linear_map(
-    raw: ArrayF32, prc: ArrayF32, lam_l2: float, model: LinearSpectralMapper
-) -> None:
-    """Warm start a linear mapper via ridge regression solved in numpy space.
+@dataclass
+class SpectraCfg:
+    fold_stat: FoldStat
+    model_type: SpecModelType = SpecModelType.LRSM
+    band_penalty: BandPenalty = BandPenalty()
+    rank: int = 12
 
-    Args:
-        raw: Training spectra prior to preprocessing, shape (N, C).
-        prc: Processed spectra used as the regression targets, shape (n_samples, C).
-        lam_l2: Ridge penalty weight applied to stabilize the linear system.
-    """
-    XT = raw.T  # (n_train, C)
-    a = (XT @ raw) + (lam_l2 * np.eye(raw.shape[1]))
-    b = XT @ prc
-    W0 = np.linalg.solve(a, b)  # (C,C)
-    b0 = prc.mean(axis=0) - (raw.mean(axis=0) @ W0)  # (C,)
-    with torch.no_grad():
-        model.proj.weight.copy_(
-            torch.from_numpy(W0.T).float().unsqueeze(-1).unsqueeze(-1)
-        )
-        model.proj_bias.copy_(torch.from_numpy(b0).float())
+
+@dataclass
+class ClassCfg:
+    H: int
+    W: int
+    model_type: ClassModelType = ClassModelType.MIL
+    hidden: int = 64
+    c_out: int = 2
+
+
+type Goal = SpectraCfg | ClassCfg
 
 
 def get_model(
-    model_type: ModelType,
-    fold_stat: FoldStat,
-    band_penalty: BandPenalty,
+    goal: Goal,
     c_in: int,
-    rank: int,
     device: torch.device,
-) -> tuple[SpectralMapper, Penalty]:
+) -> tuple[Model, Penalty]:
     """Instantiate the spectral mapper and its regularizer for the requested model type.
 
     Args:
-        model_type: Configuration value specifying the mapper architecture.
-        fold_stat: Fold-level statistics used to warm start linear models.
         c_in: Number of spectral channels available in the input tensors.
         rank: Rank used for low-rank models (ignored for linear CNN variant).
         device: Torch device to move the model and penalty onto.
-        band: Half-width of the diagonal band for `IdentityBandedPenalty`.
-        off_diag_penalty: Regularization strength for energy outside the diagonal band.
-        lam_id: Identity penalty weight (also used as ridge prior for warm start).
 
     Returns:
         Tuple comprised of the spectral mapper module and an accompanying penalty.
     """
-    model: SpectralMapper
-    match model_type:
-        case ModelType.LSM:
-            model = LinearSpectralMapper(c_in).to(device)
-            # initialize linear map for CNN only
-            init_linear_map(
-                fold_stat.train_raw_z, fold_stat.train_prc_z, band_penalty.id, model
-            )
-            penalty = band_penalty.make_penalty(model, c_in)
-        case ModelType.LRSM:
-            model = LowRankSpectralMapper(c_in, rank).to(device)
-            penalty = band_penalty.make_penalty(model, c_in)
+    model: Model
+    if isinstance(goal, SpectraCfg):
+        rank = goal.rank
+        band_penalty = goal.band_penalty
+        fold_stat = goal.fold_stat
+        match goal.model_type:
+            case SpecModelType.LSM:
+                model = LinearSpectralMapper(c_in).to(device)
+                # initialize linear map for CNN only
+                init_linear_map(
+                    fold_stat.train_raw_z, fold_stat.train_prc_z, band_penalty.id, model
+                )
+                penalty = band_penalty.make_penalty(model, c_in)
+            case SpecModelType.LRSM:
+                model = LowRankSpectralMapper(c_in, rank).to(device)
+                penalty = band_penalty.make_penalty(model, c_in)
+    elif isinstance(goal, ClassCfg):  # pyright: ignore[reportUnnecessaryIsInstance]
+        match goal.model_type:
+            case ClassModelType.CONV:
+                model = ConvSpectralClassifier(c_in, goal.c_out, goal.H, goal.W).to(
+                    device
+                )
+                penalty = Penalty(None)
+            case ClassModelType.MIL:
+                model = MILMeanHead(c_in, goal.hidden).to(device)
+                penalty = Penalty(None)
+    else:
+        raise NotImplementedError()  # pyright: ignore[reportUnreachable]
+
     return model, penalty
 
 
@@ -317,3 +378,23 @@ def get_loss_managers(
         loss_fn,
         torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd),
     )
+
+
+@dataclass
+class TrainSetup:
+    loss_fn: nn.CrossEntropyLoss | nn.MSELoss
+    optimizer: torch.optim.Optimizer
+    model: Model
+    penalty: Penalty
+
+
+def get_train_setup(
+    c_in: int,
+    device: torch.device,
+    lr: float,
+    wd: float,
+    goal: ClassCfg | SpectraCfg,
+) -> TrainSetup:
+    model, penalty = get_model(goal, c_in, device)
+    loss_fn, optimizer = get_loss_managers(model, lr, wd)
+    return TrainSetup(loss_fn, optimizer, model, penalty)
