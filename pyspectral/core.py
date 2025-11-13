@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import StrEnum, auto
+from pathlib import Path
+from typing import Any, NewType
+
+from dotenv import load_dotenv
+from loguru import logger
+import numpy as np
+import numpy.typing as npt
+
+from pyspectral.config import ArrayF, ArrayF32, MeanArray, StdArray
+
+
+def assert_same_grid(a: ArrayF, b: ArrayF, tolerance: float = 1e-9) -> None | str:
+    """Check that array 'a' and 'b' are the same shape and each element is within a tolerance."""
+    # add to a single string so that we can see both issues potentially
+    output: str = ""
+    if a.shape != b.shape:
+        output += f"Grid {a.shape=} not equal to {b.shape=}.\n"
+    if not np.allclose(a, b, atol=tolerance):
+        # np.allclose checks if the element by element array are the samef within tolerance
+        output += f"Grids differ by supplied tolerance: {tolerance}."
+    if output != "":
+        return output
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class FlatMap:
+    """A (N,) grid with (C) values representing the number spectrum recordings.
+
+    This is the *flattened* representation of the Cube, where (N == H*W) and
+    the number of channels is the number of bands (C == M).
+    """
+
+    _array: ArrayF32
+    N: int
+    C: int
+
+    def __array__(self, dtype: npt.DTypeLike | None = None) -> npt.ArrayLike:
+        return np.asarray(self._array, dtype=dtype)  # enables np.asarray(Cube)
+
+    def __len__(self) -> int:
+        return self.N
+
+    def __getitem__(self, key: slice | int) -> Any | ArrayF32:
+        return self._array[key]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """Get the shape of the map."""
+        return (self.N, self.C)
+
+    def get(self) -> ArrayF32:
+        """Get the underlying flat array explicitly."""
+        return self._array
+
+    @classmethod
+    def make(cls, array: ArrayF32) -> FlatMap:
+        if array.ndim != 2:
+            raise ValueError(f"Cube must be 3D (H, W, M). Got shape={array.shape!r}")
+        N, C = array.shape
+        return cls(_array=array, N=N, C=C)
+
+
+@dataclass(frozen=True, slots=True)
+class Cube:
+    """A (H,W) grid with (M) values representing the number spectrum recordings."""
+
+    _cube: ArrayF32
+    H: int
+    W: int
+    M: int
+
+    def __getitem__(self, key: slice | int) -> Any | ArrayF32:
+        return self._cube[key]
+
+    def __array__(self, dtype: npt.DTypeLike | None = None) -> npt.ArrayLike:
+        return np.asarray(self._cube, dtype=dtype)  # enables np.asarray(Cube)
+
+    def __len__(self) -> int:
+        return self.H
+
+    def get(self) -> ArrayF32:
+        """Get the underlying cube explicitly."""
+        return self._cube
+
+    def flatten(self) -> FlatMap:
+        """Reshape the cube to flat array: from (H, W, M) -> (H*W, M)."""
+        return FlatMap.make(
+            self._cube.reshape(-1, self.M).astype(np.float32, copy=False)
+        )
+
+    def resample_cube(self, wl_src: ArrayF, wl_dst: ArrayF) -> Cube:
+        """Resample (H,W,M_src) -> (H,W,M_dst) by 1D linear interp per pixel."""
+        flat = self.get().reshape(-1, self.M)
+        out = np.empty((flat.shape[0], wl_dst.size), dtype=np.float32)
+        for i in range(flat.shape[0]):  # NOTE: could vectorize this process
+            out[i] = np.interp(wl_dst, wl_src, flat[i])
+        return self.from_flat(
+            flat_cube=out, height=self.H, width=self.W, spec_bands=wl_dst.size
+        )
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Get the shape of the cube."""
+        return (self.H, self.W, self.M)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Cube:
+        return cls(_cube=np.array(d["_cube"]), H=d["H"], W=d["W"], M=d["M"])
+
+    @classmethod
+    def make(cls, cube: ArrayF32) -> Cube:
+        """Create a spectral Cube instance from a 3D (H, W, M) numpy array."""
+        if cube.ndim != 3:
+            raise ValueError(f"Cube must be 3D (H, W, M). Got shape={cube.shape!r}")
+        # grab the three dimensions
+        H, W, M = cube.shape
+        return cls(_cube=cube, H=H, W=W, M=M)
+
+    @classmethod
+    def from_flat(
+        cls, flat_cube: ArrayF32, height: int, width: int, spec_bands: int
+    ) -> Cube:
+        """Reshape flat array to cube: from (H*W, M) -> (H, W, M)."""
+        return cls.make(flat_cube.reshape(height, width, spec_bands).astype(np.float32))
