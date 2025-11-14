@@ -277,7 +277,6 @@ class HSIMap:
 
     @classmethod
     def from_processed(cls, path: Path) -> HSIMap | None:
-        path = Path(path)
         arrays = np.load(path.with_suffix(".npz"))
         with path.with_suffix(".json").open() as f:
             meta = json.load(f)
@@ -293,9 +292,7 @@ class HSIMap:
         return (self.presence, self.wl, (self.cube.H, self.cube.W))
 
 
-def read_class(
-    csv_file: Path | str, base_dir: Path | str
-) -> tuple[list[HSIMap], SafeData]:
+def read_class(csv_file: Path, base_dir: Path):
     """Read annotations file to retrieve HSIMaps for purpose of classification."""
 
     # NOTE: currently discard proc_path
@@ -314,9 +311,7 @@ def read_class(
             accumulation=int(r["accum"]) if opt else None,
             acq_time_s=float(r["acq_s"]) if opt else None,
         )
-        rows.append(hsi_map)
-
-    return rows, class_data
+        yield hsi_map, r
 
 
 # -- Pair rows
@@ -430,8 +425,10 @@ class SpectraPair:
 
 def convert_raw_class(csv: str | Path, base: str | Path) -> None:
     """Save HSI maps to files in raw_path."""
-    maps, safe_data = read_class(csv_file=csv, base_dir=base)
-    for map, df_row in zip(maps, safe_data):
+    csv = Path(csv) if isinstance(csv, str) else csv
+    base = Path(base) if isinstance(base, str) else base
+
+    for map, df_row in read_class(csv_file=csv, base_dir=base):
         READY_DATA_DIR.mkdir(exist_ok=True)
         new_map_path = READY_DATA_DIR / Path(df_row["raw_path"]).name
         try:
@@ -451,23 +448,47 @@ class ClassPair:
 
 def build_classification(
     base: str | Path,
-    csv: str | Path,
+    *,
+    csv: str | Path | None = None,
     peak_cfg: PeakNormConfig | None = None,
     pre_config: PreConfig | None = None,
 ) -> ClassPair:
+    """
+    Build pair of data, labels and raw spectra.
+
+    Args:
+        base: base directory containing training data.
+        csv: optional path to csv file, used only for raw data
+
+    Returns:
+        ClassPair object that contains the DataArtifacts and Spectra
+    """
+    csv = Path(csv) if isinstance(csv, str) else csv
+    base = Path(base) if isinstance(base, str) else base
     if pre_config is None:
         pre_config = PreConfig.make_min()
 
-    hsi_maps, _data = read_class(csv, base)
     presences = []
     x_list = []
     preprocess_stats, wls_per_scene, hw_list = [], [], []
-    for h in hsi_maps:
+
+    if csv is not None:
+        gen = read_class(csv, base)
+        data = map(lambda g: g[0], gen)  # grab the hsi-maps only
+    else:
+        # search for .npz, each should correspond to a json
+        paths = base.glob("*.npz")
+        data = map(lambda x: HSIMap.from_processed(x), paths)
+        data = (y for y in data if y is not None)
+
+    for h in data:
         presence, wl, hw = h.get_artifacts()
         hw_list.append(hw)
         wls_per_scene.append(wl)
         presences.append(presence)
+
         cube, stats = preprocess_cube(h.cube, wl, pre_config, peak_cfg)
+
         flat = cube.flatten()
         x_list.append(flat)
         preprocess_stats.append(stats)
