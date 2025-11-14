@@ -18,7 +18,6 @@ classifiers = [
 dependencies = [
     "beartype>=0.22.5",
     "jaxtyping>=0.3.3",
-    "jupyterlab-vim>=4.1.4",
     "loguru",
     "matplotlib>=3.10.6",
     "mkdocs",
