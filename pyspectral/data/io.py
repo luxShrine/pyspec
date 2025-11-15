@@ -3,13 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from loguru import logger
 import numpy as np
 import polars as pl
 
-from pyspectral.config import RAW_DATA_DIR, READY_DATA_DIR, RNG, ArrayF, ArrayI
+from pyspectral.config import (
+    RAW_DATA_DIR,
+    READY_DATA_DIR,
+    RNG,
+    ArrayF,
+    ArrayF32,
+    ArrayI,
+)
 from pyspectral.core import Cube, FlatMap, assert_same_grid
 from pyspectral.data.preprocessing import (
     PeakNormConfig,
@@ -115,6 +122,14 @@ class SafeData:
         return cls(df=df, optional_col=get_optional, base_dir=base, data_file=csv)
 
 
+class PreArts(TypedDict):
+    hw: list[tuple[int, int]]
+    wls: list[ArrayF]
+    pre_stats: list[PreprocStats]
+    flats: list[ArrayF32]
+    presences: list[bool]
+
+
 @dataclass(frozen=True)
 class DataArtifacts:
     scene_ids: ArrayI  # shape (S,)
@@ -127,7 +142,6 @@ class DataArtifacts:
     slices: list[slice]  # slice per scene into flat arrays
     pixel_to_scene: ArrayI  # length N: global pixel -> scene index [0..S)
     coords: ArrayI  # shape (N,2): (row,col) for each pixel
-    # offsets: ArrayI              # start index in the flat arrays
 
     def scene_slice(self, scene_idx: int) -> slice:
         return self.slices[scene_idx]
@@ -142,13 +156,11 @@ class DataArtifacts:
 
 
 def build_artifacts(
-    hw_list: list[tuple[int, int]],
-    preprocess_stats: list[PreprocStats],
     pre_config: PreConfig,
-    wls: list[ArrayF],
-    presences: list[bool],
+    pre_art: PreArts,
     scene_ids: list[int] | None = None,
 ) -> DataArtifacts:
+    hw_list = pre_art["hw"]
     S = len(hw_list)
     if scene_ids is None:
         scene_ids = list(range(S))
@@ -171,10 +183,10 @@ def build_artifacts(
 
     return DataArtifacts(
         scene_ids=scene_ids_arr,
-        preprocess_stats=preprocess_stats,
+        preprocess_stats=pre_art["pre_stats"],
         pre_config=pre_config,
-        wls=wls,
-        presences=presences,
+        wls=pre_art["wls"],
+        presences=pre_art["presences"],
         lengths=lens,
         hw=hw,
         slices=slices,
@@ -193,7 +205,8 @@ class HSIMap:
     xy: (N, 2) float64 stage coords
     spectra: (N, C) float32 intensities
     cube: (H, W, M) float32 reshaped spectral cube
-    presence
+    presence:
+    _version: float corresponding to HSI schema
     """
 
     wl: ArrayF
@@ -201,6 +214,7 @@ class HSIMap:
     spectra: FlatMap
     cube: Cube
     presence: bool
+    _version: float = 0.2
 
     def check_same_wavelength_grid(
         self,
@@ -273,6 +287,7 @@ class HSIMap:
             xy=d["xy"],
             spectra=d["spectra"],
             presence=d["presence"],
+            _version=d["_version"],
         )
 
     @classmethod
@@ -280,6 +295,14 @@ class HSIMap:
         arrays = np.load(path.with_suffix(".npz"))
         with path.with_suffix(".json").open() as f:
             meta = json.load(f)
+
+        # TODO: in future updates of HSIMap schema, change this to properly
+        # handle errors
+        try:
+            if c := float(meta["_version"]):
+                print(f"Version found as: {c}")
+        except KeyError as e:
+            print(e)
 
         restored = restore_arrays(meta, arrays)
 
@@ -302,8 +325,6 @@ def read_class(csv_file: Path, base_dir: Path):
     opt = class_data.optional_col
 
     # materialize rows
-    rows: list[HSIMap] = []
-
     for r in class_data:
         hsi_map = HSIMap.from_txt(
             txt_path=base / r["raw_path"],
@@ -381,41 +402,43 @@ class SpectraPair:
         peak_cfg: PeakNormConfig | None = None,
         pre_config: PreConfig | None = None,
     ) -> tuple[SpectraPair, DataArtifacts]:
-        presences = []
         x_list, y_list = [], []
-        preprocess_stats, wls_per_scene, hw_list = [], [], []
+        pre_arts: PreArts = {
+            "hw": [],
+            "wls": [],
+            "pre_stats": [],
+            "flats": [],
+            "presences": [],
+        }
 
         if pre_config is None:
             pre_config = PreConfig.make_min()
 
         for r in rows:
             raw_map, prc_map = r.retrieve_maps()
-            presences.append(raw_map.presence)
-
             same_grid_cubes = raw_map.check_same_wavelength_grid(prc_map, ref_wl)
-            wls_per_scene.append(same_grid_cubes.common_wl)
 
             cube_x, cube_y, train_stats = same_grid_cubes.pre_process(
                 pre_config, peak_cfg
             )
-            hw_list.append((cube_x.H, cube_x.W))
-            preprocess_stats.append(train_stats)
 
-            xpix = cube_x.get().reshape(-1, cube_x.M).astype(np.float64)
-            ypix = cube_y.get().reshape(-1, cube_x.M).astype(np.float64)
-
+            xpix = cube_x.flatten().get().astype(np.float64)
+            ypix = cube_y.flatten().get().astype(np.float64)
             x_list.append(xpix)
             y_list.append(ypix)
+
+            pre_arts["hw"].append((cube_x.H, cube_x.W))
+            pre_arts["wls"].append(same_grid_cubes.common_wl)
+            pre_arts["presences"].append(raw_map.presence)
+            pre_arts["flats"].append(xpix.astype(np.float32))
+            pre_arts["pre_stats"].append(train_stats)
 
         x_all = np.vstack(x_list, dtype=np.float64)
         y_all = np.vstack(y_list, dtype=np.float64)
         arts = build_artifacts(
-            hw_list,
-            preprocess_stats,
             pre_config,
-            wls=wls_per_scene,
-            presences=presences,
-            scene_ids=list(range(len(hw_list))),
+            pre_art=pre_arts,
+            scene_ids=list(range(len(pre_arts["hw"]))),
         )
         return SpectraPair(x_all, y_all), arts
 
@@ -465,12 +488,7 @@ def build_classification(
     """
     csv = Path(csv) if isinstance(csv, str) else csv
     base = Path(base) if isinstance(base, str) else base
-    if pre_config is None:
-        pre_config = PreConfig.make_min()
-
-    presences = []
-    x_list = []
-    preprocess_stats, wls_per_scene, hw_list = [], [], []
+    pre_config = PreConfig.make_min() if pre_config is None else pre_config
 
     if csv is not None:
         gen = read_class(csv, base)
@@ -481,27 +499,31 @@ def build_classification(
         data = map(lambda x: HSIMap.from_processed(x), paths)
         data = (y for y in data if y is not None)
 
+    pre_arts: PreArts = {
+        "hw": [],
+        "wls": [],
+        "pre_stats": [],
+        "flats": [],
+        "presences": [],
+    }
+
     for h in data:
         presence, wl, hw = h.get_artifacts()
-        hw_list.append(hw)
-        wls_per_scene.append(wl)
-        presences.append(presence)
-
         cube, stats = preprocess_cube(h.cube, wl, pre_config, peak_cfg)
-
         flat = cube.flatten()
-        x_list.append(flat)
-        preprocess_stats.append(stats)
 
-    x_all = np.vstack(x_list, dtype=np.float64)
+        pre_arts["hw"].append(hw)
+        pre_arts["wls"].append(wl)
+        pre_arts["presences"].append(presence)
+        pre_arts["flats"].append(flat.get())
+        pre_arts["pre_stats"].append(stats)
+
+    x_all = np.vstack(pre_arts["flats"], dtype=np.float64)
 
     arts = build_artifacts(
-        hw_list,
-        preprocess_stats,
         pre_config,
-        wls=wls_per_scene,
-        presences=presences,
-        scene_ids=list(range(len(hw_list))),
+        pre_art=pre_arts,
+        scene_ids=list(range(len(pre_arts["hw"]))),
     )
 
     return ClassPair(x_all, arts)
