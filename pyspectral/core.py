@@ -13,6 +13,10 @@ import numpy.typing as npt
 from pyspectral.config import ArrayF, ArrayF32, MeanArray, StdArray
 
 
+def apply_z(y: np.ndarray, mean: MeanArray, std: StdArray) -> np.ndarray:
+    return ((y - mean) / std).astype(np.float32)
+
+
 def assert_same_grid(a: ArrayF, b: ArrayF, tolerance: float = 1e-9) -> None | str:
     """Check that array 'a' and 'b' are the same shape and each element is within a tolerance."""
     # add to a single string so that we can see both issues potentially
