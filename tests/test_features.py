@@ -2,13 +2,11 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
-from pyspectral.config import Cube
-from pyspectral.features import (
+from pyspectral.core import Cube, assert_same_grid
+from pyspectral.data.preprocessing import (
     SmoothCfg,
-    _normalize_to_peak,
-    assert_same_grid,
     find_peak_in_window,
-    resample_cube,
+    normalize_to_peak,
 )
 
 
@@ -28,7 +26,7 @@ def test_resample_cube_interpolates_along_wavelength_axis() -> None:
     dst_wl = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float64)
     cube = Cube.make(np.array([[[0.0, 1.0, 2.0]]], dtype=np.float32))
 
-    resampled = resample_cube(cube, src_wl, dst_wl)
+    resampled = cube.resample_cube(src_wl, dst_wl)
 
     assert resampled.shape == (1, 1, dst_wl.size)
     npt.assert_allclose(
@@ -46,7 +44,7 @@ def test_normalize_to_peak_scales_each_row() -> None:
         dtype=np.float32,
     )
 
-    normalized = _normalize_to_peak(spectra, wl, center=1010.0, halfwidth=5.0)
+    normalized = normalize_to_peak(spectra, wl, center=1010.0, halfwidth=5.0)
     mask = (wl >= 1005.0) & (wl <= 1015.0)
     denom = spectra[:, mask].max(axis=1, keepdims=True) + 1e-8
 
@@ -58,7 +56,7 @@ def test_normalize_to_peak_raises_on_empty_window() -> None:
     spectra = np.ones((2, 4), dtype=np.float32)
 
     with pytest.raises(ValueError):
-        _normalize_to_peak(spectra, wl, center=4000.0, halfwidth=5.0)
+        normalize_to_peak(spectra, wl, center=4000.0, halfwidth=5.0)
 
 
 def test_find_peak_in_window_prefers_prominent_peak() -> None:
