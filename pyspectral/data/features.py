@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from loguru import logger
 import numpy as np
 
 from pyspectral.config import REF_PHE, ArrayF, ArrayF32, MeanArray, StdArray
@@ -204,46 +205,55 @@ def _log_ratio_area(
     wl_roi: ArrayF,
     wl_base: ArrayF,
 ) -> float:
-    # return nan if nan
     ar = _area_under_curve(roi, wl_roi)
     ab = _area_under_curve(baseline_region, wl_base)
+
+    # if we cant compute area, treat it as no contrast, zero
     if not np.isfinite(ar) or not np.isfinite(ab):
-        return np.nan
+        return 0.0
+
     # prevent negative with small min
     min = np.median(roi) * 0.05
     roi_area = max(ar, min)
     base_area = max(ab, min)
-    ratio = np.log(base_area / roi_area)
-    return ratio
+
+    # clip ratio if above/below certain extremes
+    raw_ratio = base_area / roi_area
+    clip_ratio = np.clip(raw_ratio, 1e-5, 1e5)
+    if raw_ratio != clip_ratio:
+        logger.debug(f"Clipping ratio {raw_ratio} -> {clip_ratio}")
+    return np.log(clip_ratio)
 
 
-def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF):
+def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF) -> tuple[float, float]:
     elements = roi.size
     if elements == 0:
-        return np.nan, np.nan
+        return 0.0, 0.0
+
     i = int(np.nanargmax(roi))
     peak = float(roi[i])
     if not np.isfinite(peak) or elements < 3 or peak <= 0:
-        return peak, np.nan
+        return peak, 0.0
 
     half_max = 0.5 * peak
-    # left crossing (<= hp) just before peak
+    # left crossing (<= hm) just before peak
     left_idx = np.where(roi[:i] <= half_max)[0]
     right_idx = np.where(roi[i:] <= half_max)[0]
 
     if left_idx.size == 0 and right_idx.size == 0:
-        return peak, np.nan
-    else:
-        xl, xr = 0, 0
-        if left_idx.size != 0:
-            li = left_idx[-1]  # last index <= hm on the left
-            xl = np.interp(li, xp=roi, fp=wl_roi)
-        if right_idx.size != 0:
-            ri = i + right_idx[0]  # first index <= hm on the right
-            xr = np.interp(ri, xp=roi, fp=wl_roi)
+        return peak, 0.0
 
-        # full width or half width
-        return peak, float(abs(xr - xl))
+    xl, xr = 0, 0
+    if left_idx.size != 0:
+        li = left_idx[-1]  # last index <= hm on the left
+        xl = np.interp(li, xp=roi, fp=wl_roi)
+    if right_idx.size != 0:
+        ri = i + right_idx[0]  # first index <= hm on the right
+        xr = np.interp(ri, xp=roi, fp=wl_roi)
+
+    width = float(abs(xr - xl))
+    # full width or half width
+    return peak, width
 
 
 @dataclass(frozen=True, slots=True)
