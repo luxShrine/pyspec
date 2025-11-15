@@ -124,9 +124,9 @@ class OOFStats:
             )
         preds_fold = np.concatenate(best_preds_fold, axis=0)
         self.pred_std[test_idx] = preds_fold
-        self.true_std[test_idx] = fold_stat.test_prc_z
+        self.true_std[test_idx] = fold_stat.te_y_znorm.z
         # inverse transform to original Y units: y = y_std*sd + mu
-        y_pred_orig = preds_fold * fold_stat.y_std + fold_stat.y_mean
+        y_pred_orig = preds_fold * fold_stat.tr_y_znorm.std + fold_stat.tr_y_znorm.mean
         self.pred_orig[test_idx] = y_pred_orig
 
         self.epoch_loss.append(fold_epoch_loss)
@@ -343,6 +343,7 @@ def train_epoch(
         optimizer.step()
 
         total_loss += float(batch_loss.detach())
+
     return total_loss / len(dataloader)
 
 
@@ -413,6 +414,7 @@ def run_epochs(
             train_epoch(train_dl, model, loss_fn, optimizer, device, penalty)
         )
         test_result = test_epoch(test_dl, model, loss_fn, device)
+        print(f"DEBUGPRINT[74]: train.py:416: test_result={test_result}")
         fi = test_result.fraction_improved
 
         vl_loss.append(test_result.test_loss)
@@ -535,7 +537,7 @@ def train_class(
 
     # TODO: calculate this instead of magic
     h = w = 8
-    ppt = int(h / 2)
+    _pixels_per_tile = int(h / 2)
 
     region_set = RegionSet()
     oof_stats = ClassOOFStats(class_pair.arts)
@@ -551,11 +553,14 @@ def train_class(
             tr_ds, te_ds, device, batch_size, collate_fn=scene_collate
         )
         c_in = tr_ds[0][0].shape[0]
+        d_in = tr_ds[0][0].shape[1]
         # c_out = tr_ds[0][1].shape[0]
+        class_cfg = ClassCfg(h, w, d_in=d_in, model_type=ClassModelType.MIL)
 
         # setup model
-        cfg = ClassCfg(h, w, ClassModelType.MIL)
-        train_setup = get_train_setup(c_in, device, lr=lr, wd=wd, goal=cfg)
+        train_setup = get_train_setup(
+            c_in=c_in, device=device, lr=lr, wd=wd, goal=class_cfg
+        )
 
         if fold == 0:
             details = f"model type: {train_setup.model} \n"

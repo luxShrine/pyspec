@@ -162,8 +162,6 @@ class PixelSpectraDataset(Dataset[SpectralData]):
 
 
 def build_spec_datasets(n_splits: int, data: SpectraPair, arts: DataArtifacts):
-    wl = arts.wls[0]
-
     # per-pixel features
     raw = data.X_raw.astype(np.float32)  # (N,C)
     prc = data.Y_proc.astype(np.float32)  # (N,C)
@@ -179,12 +177,9 @@ def build_spec_datasets(n_splits: int, data: SpectraPair, arts: DataArtifacts):
         # take out the sections of the arrays by index & normalize around average
         fold_stat = FoldStat.from_subset(raw[tr_s], prc[tr_s], raw[te_s], prc[te_s])
 
-        # create baseline to compare to.
-        yhat_te_std, yhat_te_orig = fold_stat.get_baseline()
-
         # must recreate model, datasets & loaders each fold
-        train_ds = PixelSpectraDataset(fold_stat.train_raw_z, fold_stat.train_prc_z)
-        test_ds = PixelSpectraDataset(fold_stat.test_raw_z, fold_stat.test_prc_z)
+        train_ds = PixelSpectraDataset(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
+        test_ds = PixelSpectraDataset(fold_stat.te_x_znorm.z, fold_stat.te_y_znorm.z)
 
         yield (train_ds, tr_s), (test_ds, te_s), fold_stat
 

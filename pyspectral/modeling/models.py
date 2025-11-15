@@ -353,7 +353,10 @@ def get_model(
                 model = LinearSpectralMapper(c_in).to(device)
                 # initialize linear map for CNN only
                 init_linear_map(
-                    fold_stat.train_raw_z, fold_stat.train_prc_z, band_penalty.id, model
+                    fold_stat.tr_x_znorm.z,
+                    fold_stat.tr_y_znorm.z,
+                    band_penalty.id,
+                    model,
                 )
                 penalty = band_penalty.make_penalty(model, c_in)
             case SpecModelType.LRSM:

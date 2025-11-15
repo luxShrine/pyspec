@@ -73,8 +73,8 @@ def diagonal_affine_predict(x: np.ndarray, y: np.ndarray, cv: CrossValidator) ->
     for tr_idx, te_idx in cv.split(x, y):
         # take out the sections of the arrays by index & normalize around average
         fold_stat = FoldStat.from_subset(x[tr_idx], y[tr_idx], x[te_idx], y[te_idx])
-        a, b = fit_diag_affine(fold_stat.train_raw_z, fold_stat.train_prc_z)
-        yhat[te_idx] = predict_diag_affine(fold_stat.test_raw_z, a, b)
+        a, b = fit_diag_affine(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
+        yhat[te_idx] = predict_diag_affine(fold_stat.te_x_znorm.z, a, b)
     return yhat
 
 
@@ -93,8 +93,8 @@ def pcr_predict(x: np.ndarray, y: np.ndarray, cv: CrossValidator) -> ArrayF:
                 ),
             ]
         )
-        pipe.fit(fold_stat.train_raw_z, fold_stat.train_prc_z)
-        yhat[te_idx] = pipe.predict(fold_stat.test_raw_z)
+        pipe.fit(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
+        yhat[te_idx] = pipe.predict(fold_stat.te_x_znorm.z)
     return yhat
 
 
@@ -116,9 +116,9 @@ def multitask_elasticnet_predict(
             fit_intercept=True,
             # verbose=1,
         )
-        model.fit(fold_stat.train_raw_z, fold_stat.train_prc_z)
-        Yte_std = model.predict(fold_stat.test_raw_z)
-        yhat[te_idx] = (Yte_std * fold_stat.y_std) + fold_stat.y_mean
+        model.fit(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
+        Yte_std = model.predict(fold_stat.te_x_znorm.z)
+        yhat[te_idx] = (Yte_std * fold_stat.tr_y_znorm.std) + fold_stat.tr_y_znorm.mean
     return yhat
 
 

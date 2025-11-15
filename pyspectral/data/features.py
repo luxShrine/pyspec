@@ -5,8 +5,10 @@ from typing import Literal
 
 from loguru import logger
 import numpy as np
+from numpy.typing import DTypeLike
 
 from pyspectral.config import REF_PHE, ArrayF, ArrayF32, MeanArray, StdArray
+from pyspectral.core import apply_z
 
 
 def fit_diag_affine(x_std: ArrayF32, y_std: ArrayF32) -> tuple[ArrayF, ArrayF]:
@@ -35,68 +37,81 @@ def predict_diag_affine(x_std: ArrayF32, a: ArrayF, b: ArrayF) -> ArrayF:
     return (a * x_std) + b
 
 
+class NormalizedData:
+    """
+    Input Args:
+        array: shape (N, C)
+
+    Fields:
+        original: shape (N, C)
+        mean: shape (C,)
+        std: shape (C,)
+        z: shape (N, C), normalized original array
+
+
+    """
+
+    def __init__(
+        self,
+        array: np.ndarray,
+        *,
+        axis: int | None = None,
+        dtype: DTypeLike | None = None,
+        mean: MeanArray | None = None,
+        std: StdArray | None = None,
+    ):
+        """Optionally provide an overiding std and mean"""
+        self.original: np.ndarray = array
+        self.mean: MeanArray = (
+            MeanArray(array.mean(axis=axis, dtype=dtype)) if mean is None else mean
+        )
+        self.std: StdArray = (
+            StdArray(array.std(axis=axis, dtype=dtype) + 1e-8) if std is None else std
+        )  # prevent zero std
+        self.z: np.ndarray = apply_z(array, self.mean, self.std)
+
+    def get_stats(self) -> tuple[MeanArray, StdArray]:
+        return self.mean, self.std
+
+
 @dataclass(frozen=True, slots=True)
 class FoldStat:
-    x_mean: MeanArray  # (C,)
-    y_mean: MeanArray
-    x_std: StdArray  # (C,)
-    y_std: StdArray
-    train_raw_z: ArrayF32
-    train_prc_z: ArrayF32
-    test_raw_z: ArrayF32
-    test_prc_z: ArrayF32
+    tr_x_znorm: NormalizedData
+    tr_y_znorm: NormalizedData
+    te_x_znorm: NormalizedData
+    te_y_znorm: NormalizedData
 
     def get_baseline(self) -> tuple[ArrayF, ArrayF]:
+        x_std = self.tr_x_znorm.z
         # find the slope & intercept for linear relation between raw and correct z weights; shape: (C,), (C,)
-        a, b = fit_diag_affine(self.train_raw_z, self.train_prc_z)
+        a, b = fit_diag_affine(x_std, self.tr_y_znorm.z)
         # using the train fit, predict the normalized result
-        yhat_test_std = predict_diag_affine(self.test_raw_z, a, b)  # (n_test, C)
+        yhat_test_std = predict_diag_affine(x_std, a, b)  # (n_test, C)
         # inverse to original prediction units for reporting; shape: (n_test, C)
-        yhat_test_orig = (yhat_test_std * self.y_std) + self.y_mean
+        yhat_test_orig = (yhat_test_std * self.tr_y_znorm.std) + self.tr_y_znorm.mean
         return yhat_test_std, yhat_test_orig
-
-    @staticmethod
-    def apply_z(y: ArrayF32, mean: MeanArray, std: StdArray) -> ArrayF32:
-        return ((y - mean) / std).astype(np.float32)
 
     @classmethod
     def from_subset(
         cls,
-        raw_train_subset: ArrayF32 | ArrayF,
-        prc_train_subset: ArrayF32 | ArrayF,
-        raw_test_subset: ArrayF32 | ArrayF,
-        prc_test_subset: ArrayF32 | ArrayF,
+        raw_train_subset: np.ndarray,
+        prc_train_subset: np.ndarray,
+        raw_test_subset: np.ndarray,
+        prc_test_subset: np.ndarray,
     ) -> FoldStat:
         # Per-fold std deviation & mean (fit on train only)
-        raw_mean = MeanArray(raw_train_subset.mean(axis=0).astype(np.float32))
-        prc_mean = MeanArray(prc_train_subset.mean(axis=0).astype(np.float32))
-        raw_std = StdArray(
-            raw_train_subset.std(axis=0).astype(np.float32) + 1e-8
-        )  # prevent zero
-        prc_std = StdArray(prc_train_subset.std(axis=0).astype(np.float32) + 1e-8)
+        tr_raw_z = NormalizedData(raw_train_subset, axis=0)
+        tr_prc_z = NormalizedData(prc_train_subset, axis=0)
+        raw_mean, raw_std = tr_raw_z.get_stats()
+        prc_mean, prc_std = tr_prc_z.get_stats()
+        te_raw_z = NormalizedData(raw_test_subset, mean=raw_mean, std=raw_std)
+        te_prc_z = NormalizedData(prc_test_subset, mean=prc_mean, std=prc_std)
 
-        # normalize around average
-        tr_raw_z = cls.apply_z(
-            raw_train_subset.astype(np.float32, copy=False), raw_mean, raw_std
-        )  # (n_test, C)
-        tr_prc_z = cls.apply_z(
-            prc_train_subset.astype(np.float32, copy=False), prc_mean, prc_std
-        )
-        te_raw_z = cls.apply_z(
-            raw_test_subset.astype(np.float32, copy=False), raw_mean, raw_std
-        )
-        te_prc_z = cls.apply_z(
-            prc_test_subset.astype(np.float32, copy=False), prc_mean, prc_std
-        )
         return cls(
-            x_mean=raw_mean,
-            y_mean=prc_mean,
-            x_std=raw_std,
-            y_std=prc_std,
-            train_raw_z=tr_raw_z,
-            train_prc_z=tr_prc_z,
-            test_raw_z=te_raw_z,
-            test_prc_z=te_prc_z,
+            tr_x_znorm=tr_raw_z,
+            tr_y_znorm=tr_prc_z,
+            te_x_znorm=te_raw_z,
+            te_y_znorm=te_prc_z,
         )
 
 

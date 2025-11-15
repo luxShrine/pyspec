@@ -365,31 +365,7 @@ class PairRow:
         return (x_map, y_map)
 
 
-def read_pairs(csv_file: Path | str, base_dir: Path | str) -> list[PairRow]:
-    """Read annotations file to retrieve PairRows."""
-
-    # check optional cols.
-    optional_col = {"acq_s", "accum"}
-    pair_rows = SafeData.create(base_dir, csv_file, optional_col)
-    base = pair_rows.base_dir
-    opt = pair_rows.optional_col
-
-    # materialize rows
-    rows: list[PairRow] = []
-    for r in pair_rows:
-        pair_row = PairRow(
-            raw_path=base / Path(r["raw_path"]),
-            proc_path=base / Path(r["proc_path"]),
-            presence=bool(r["presence"]),
-            accumulation=int(r["accum"]) if opt else None,
-            acquisition=float(r["acq_s"]) if opt else None,
-        )
-        rows.append(pair_row)
-
-    return rows
-
-
-# TODO: convert to using FlatMap? move to dataset?
+# TODO: convert to using FlatMap?
 @dataclass(frozen=True)
 class SpectraPair:
     X_raw: ArrayF  # (N, C)
@@ -441,6 +417,30 @@ class SpectraPair:
             scene_ids=list(range(len(pre_arts["hw"]))),
         )
         return SpectraPair(x_all, y_all), arts
+
+
+def read_pairs(csv_file: Path | str, base_dir: Path | str) -> list[PairRow]:
+    """Read annotations file to retrieve PairRows."""
+
+    # check optional cols.
+    optional_col = {"acq_s", "accum"}
+    pair_rows = SafeData.create(base_dir, csv_file, optional_col)
+    base = pair_rows.base_dir
+    opt = pair_rows.optional_col
+
+    # materialize rows
+    rows: list[PairRow] = []
+    for r in pair_rows:
+        pair_row = PairRow(
+            raw_path=base / Path(r["raw_path"]),
+            proc_path=base / Path(r["proc_path"]),
+            presence=bool(r["presence"]),
+            accumulation=int(r["accum"]) if opt else None,
+            acquisition=float(r["acq_s"]) if opt else None,
+        )
+        rows.append(pair_row)
+
+    return rows
 
 
 # -- helper for converting raw text files to structured data
