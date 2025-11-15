@@ -26,17 +26,19 @@ type OneDimTensor = Float[Tensor, "1"]
 type ZeroDimTensor = Float[Tensor, ""]
 
 type FeatTensor = Float[Tensor, "B T D"]
+type ReFeatTensor = Float[Tensor, "B D T"]
 type MaskTensor = Bool[Tensor, "B T"]
 
 # -- multiple-instance learning model
+# replace with max/noisy-OR/attention if they are better
 
 
 class MILMeanHead(nn.Module):
-    def __init__(self, c_in: int, hidden: int = 64):
+    def __init__(self, d_in: int, hidden: int = 64):
         super().__init__()
-        self.net: nn.Sequential = nn.Sequential(
-            nn.LayerNorm(c_in),
-            nn.Linear(c_in, hidden),
+        self.ff: nn.Sequential = nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, hidden),
             nn.GELU(),
             nn.Linear(hidden, 1),  # per-pixel logit
         )
@@ -50,11 +52,19 @@ class MILMeanHead(nn.Module):
             mask: (B,T)
         """
 
-        z = self.net(X).squeeze(-1)  # (B,T)
-        p = torch.sigmoid(z)
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            raise ValueError("Non-finite features in X")
+        z: Float[Tensor, "B T"] = self.ff(X).squeeze(-1)
+        if torch.isnan(z).any() or torch.isinf(z).any():
+            raise ValueError("Non-finite logits z")
+        p: Float[Tensor, "B T"] = torch.sigmoid(z)
+        if torch.isnan(p).any():
+            raise ValueError("Non-finite probabilities p")
         # masked mean pooling -> map probability
-        denom = mask.float().sum(dim=1).clamp_min(1.0)
-        prob = (p * mask).sum(dim=1) / denom  # (B,)
+        denom: Float[Tensor, "B"] = mask.float().sum(dim=1).clamp_min(1.0)
+        xnum = p * mask
+        num = xnum.sum(dim=1)
+        prob: Float[Tensor, "B"] = num / denom  # (B,)
         return prob, z, p
 
 
@@ -309,6 +319,7 @@ class SpectraCfg:
 class ClassCfg:
     H: int
     W: int
+    d_in: int
     model_type: ClassModelType = ClassModelType.MIL
     hidden: int = 64
     c_out: int = 2
@@ -356,10 +367,11 @@ def get_model(
                 )
                 penalty = Penalty(None)
             case ClassModelType.MIL:
-                model = MILMeanHead(c_in, goal.hidden).to(device)
+                d_in = goal.d_in
+                model = MILMeanHead(d_in, goal.hidden).to(device)
                 penalty = Penalty(None)
     else:
-        raise NotImplementedError()  # pyright: ignore[reportUnreachable]
+        raise NotImplementedError(f"{type(goal)}")  # pyright: ignore[reportUnreachable]
 
     return model, penalty
 
@@ -368,10 +380,12 @@ def get_loss_managers(
     model: nn.Module,
     lr: float = 5e-4,
     wd: float = 1e-4,
-) -> tuple[nn.CrossEntropyLoss | nn.MSELoss, torch.optim.Optimizer]:
+) -> tuple[nn.CrossEntropyLoss | nn.BCELoss | nn.MSELoss, torch.optim.Optimizer]:
     """Create the optimizer and loss function directly from object."""
     if isinstance(model, ConvSpectralClassifier):
         loss_fn = nn.CrossEntropyLoss()
+    elif isinstance(model, MILMeanHead):
+        loss_fn = nn.BCELoss()
     else:
         loss_fn = nn.MSELoss()
     return (
@@ -382,7 +396,7 @@ def get_loss_managers(
 
 @dataclass
 class TrainSetup:
-    loss_fn: nn.CrossEntropyLoss | nn.MSELoss
+    loss_fn: nn.CrossEntropyLoss | nn.MSELoss | nn.BCELoss
     optimizer: torch.optim.Optimizer
     model: Model
     penalty: Penalty
@@ -395,6 +409,6 @@ def get_train_setup(
     wd: float,
     goal: ClassCfg | SpectraCfg,
 ) -> TrainSetup:
-    model, penalty = get_model(goal, c_in, device)
+    model, penalty = get_model(goal=goal, c_in=c_in, device=device)
     loss_fn, optimizer = get_loss_managers(model, lr, wd)
     return TrainSetup(loss_fn, optimizer, model, penalty)
