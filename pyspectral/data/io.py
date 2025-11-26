@@ -218,20 +218,23 @@ def build_artifacts(
     scene_ids: list[int] | None = None,
 ) -> DataArtifacts:
     hw_list = pre_art["hw"]
-    S = len(hw_list)
+    scenes = len(hw_list)
     if scene_ids is None:
-        scene_ids = list(range(S))
+        scene_ids = list(range(scenes))
     lens = np.array([H * W for (H, W) in hw_list], dtype=np.int64)
     offsets = np.concatenate(([0], np.cumsum(lens)[:-1]))
     slices = [slice(o, o + L) for o, L in zip(offsets, lens)]
 
-    # pixel -> scene map (fast reverse index)
-    pixel_to_scene = np.repeat(np.arange(S, dtype=np.int64), lens)
+    # pixel -> scene map
+    s_arr = np.arange(scenes, dtype=np.int64)
+    pixel_to_scene: np.ndarray[tuple[int], np.dtype[np.intp]] = np.repeat(s_arr, lens)
 
     # per-pixel (row,col)
     coords_per_scene = []
     for H, W in hw_list:
-        rr, cc = np.unravel_index(np.arange(H * W, dtype=np.int64), (H, W))
+        # 0, ..., H*W - 1 -> (H,W) grid, where does each pixel lie
+        arr_pixels = np.arange(H * W, dtype=np.int64)
+        rr, cc = np.unravel_index(arr_pixels, (H, W))
         coords_per_scene.append(np.stack([rr, cc], axis=1))
     coords = np.vstack(coords_per_scene).astype(np.int64)
 
@@ -338,12 +341,32 @@ class HSIMap:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> HSIMap:
+        cube = Cube.from_dict(d["cube"])
+        try:
+            ver = float(d["_version"])
+            logger.debug(f"Version found as: {ver}")
+            if ver == 0.2:
+                # presence is only a boolean
+                logger.debug("Version does not include boolean map.")
+                presence = d["presence"]
+                h, w = cube.H, cube.W
+                mapping = Presence.create_map(h, w, presence)
+                presence = Presence(mean=np.float64(d["presence"]), map=mapping)
+            elif ver == 0.3:
+                # presence is a map or boolean
+                presence = Presence.from_dict(d["presence"])
+            else:
+                raise NotImplementedError
+        except KeyError as e:
+            logger.exception(f"key error loading processed HSI map: {e}")
+            raise e
+
         return cls(
-            cube=Cube.from_dict(d["cube"]),
+            cube=cube,
             wl=d["wl"],
             xy=d["xy"],
-            spectra=d["spectra"],
-            presence=d["presence"],
+            spectra=FlatMap.from_dict(d["spectra"]),
+            presence=presence,
             _version=d["_version"],
         )
 
@@ -353,16 +376,7 @@ class HSIMap:
         with path.with_suffix(".json").open() as f:
             meta = json.load(f)
 
-        # TODO: in future updates of HSIMap schema, change this to properly
-        # handle errors
-        try:
-            if c := float(meta["_version"]):
-                print(f"Version found as: {c}")
-        except KeyError as e:
-            print(e)
-
         restored = restore_arrays(meta, arrays)
-
         # reconstruct as nested dict/list/scalars
         if isinstance(restored, dict):
             return cls.from_dict(restored)
@@ -385,7 +399,7 @@ def read_class(csv_file: Path, base_dir: Path):
     for r in class_data:
         hsi_map = HSIMap.from_txt(
             txt_path=base / r["raw_path"],
-            presence=bool(r["presence"]),
+            presence=Presence.from_dict(r["presence"]),
             accumulation=int(r["accum"]) if opt else None,
             acq_time_s=float(r["acq_s"]) if opt else None,
         )
@@ -405,20 +419,32 @@ class PairRow:
 
     def retrieve_maps(self) -> tuple[HSIMap, HSIMap]:
         """Load pair of HSIMaps, (raw, processed)."""
+        # setup by assuming dimensions, we dont have the dimensions atm.
+        h = w = 8
+        pres_map = Presence.create_map(h, w, self.presence)
+        pres = Presence(np.float64(self.presence), pres_map)
+
         x_map = HSIMap.from_txt(
             self.raw_path,
-            self.presence,
+            pres,
             self.acquisition,
             self.accumulation,
         )
         y_map = HSIMap.from_txt(
             self.proc_path,
-            self.presence,
+            pres,
             self.acquisition,
             self.accumulation,
         )
         if err := assert_same_grid(x_map.xy, y_map.xy):
             raise RuntimeError(err)
+
+        # match presence to grid properly with known dimensions
+        h, w = x_map.cube.H, x_map.cube.W
+        pres_map = Presence.create_map(h, w, self.presence)
+        pres = Presence(np.float64(self.presence), pres_map)
+        x_map = replace(x_map, presence=pres)
+        y_map = replace(y_map, presence=pres)
         return (x_map, y_map)
 
 
@@ -463,7 +489,7 @@ class SpectraPair:
             pre_arts["hw"].append((cube_x.H, cube_x.W))
             pre_arts["wls"].append(same_grid_cubes.common_wl)
             pre_arts["presences"].append(raw_map.presence)
-            pre_arts["flats"].append(xpix.astype(np.float32))
+            pre_arts["flats"].append(xpix)
             pre_arts["pre_stats"].append(train_stats)
 
         x_all = np.vstack(x_list, dtype=np.float64)
@@ -543,11 +569,11 @@ def build_classification(
     Returns:
         ClassPair object that contains the DataArtifacts and Spectra
     """
-    csv = Path(csv) if isinstance(csv, str) else csv
     base = Path(base) if isinstance(base, str) else base
     pre_config = PreConfig.make_min() if pre_config is None else pre_config
 
     if csv is not None:
+        csv = Path(csv) if isinstance(csv, str) else csv
         gen = read_class(csv, base)
         data = map(lambda g: g[0], gen)  # grab the hsi-maps only
     else:
