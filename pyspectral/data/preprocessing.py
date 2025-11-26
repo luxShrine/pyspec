@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import NewType, cast
+from typing import cast
 
 from loguru import logger
 import numpy as np

@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from enum import StrEnum, auto
 from pathlib import Path
-from typing import NewType
 
 from dotenv import load_dotenv
 from loguru import logger
 import numpy as np
-import numpy.typing as npt
 
 # Load environment variables from .env file if it exists
 load_dotenv()

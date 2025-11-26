@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any
 
 from loguru import logger
 import numpy as np
@@ -19,17 +17,13 @@ from pyspectral.data.dataset import (
     pixel_collate,
     scene_collate,
 )
-from pyspectral.data.features import FoldStat, RegionSet
+from pyspectral.data.features import RegionSet
 from pyspectral.data.io import ClassPair, DataArtifacts, SpectraPair
 import pyspectral.modeling.models as pm
 import pyspectral.modeling.oof as oof
 from pyspectral.types import (
-    Arr1DF,
-    ArrayF,
     ArrayF32,
-    ArrayI,
     ClassModelType,
-    IndexArray,
     SpecModelType,
 )
 

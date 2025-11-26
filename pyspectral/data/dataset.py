@@ -25,7 +25,6 @@ from pyspectral.types import (
     ArrayF32,
     ArrayI,
     ClassPixIndices,
-    IndexArray,
     KfoldPixIndices,
     SplitIter,
 )
