@@ -159,6 +159,22 @@ class ALS:
     n_iter: int = 20
     tolerance: float = 1e-4
 
+    def _solve_for_z(
+        self,
+        dt_d: sparse.csc_array,
+        wi: Arr1DF,
+        yi: np.ndarray[tuple[int, ...], np.dtype[np.float64]],
+        C: int,
+    ) -> sparse.csc_array:
+        """Construct A = W + λ D^T D, and solve for z in Az = Wy."""
+        lam = self.smoothness
+
+        W: sparse.dia_matrix = sparse.diags(wi, 0, shape=(C, C), format="csc")
+        A: sparse.dia_matrix = W + (lam * dt_d)
+        b = wi * yi  # W y
+        zi: sparse.csc_array = spsolve(A, b)
+        return zi
+
     def remove_baseline(
         self,
         y: Arr1DF | Arr2DF,
@@ -192,9 +208,7 @@ class ALS:
         MASK_HALF_WIDTH: int = 6
         axis: int = -1  # Spectral axis.
         p = self.asymmetry
-        lam = self.smoothness
 
-        y = np.asarray(y)
         y = np.moveaxis(y, axis, -1)  # operate on last axis
         orig_shape = y.shape
         C = y.shape[-1]
@@ -240,11 +254,7 @@ class ALS:
             zi = None
             zi_prev: None | np.ndarray = None
             for _it in range(self.n_iter):
-                # Construct A = W + λ D^T D, and solve for z in Az = Wy
-                W = sparse.diags(wi, 0, shape=(C, C), format="csc")
-                A = W + (lam * dt_d)
-                b = wi * yi  # W y
-                zi = spsolve(A, b)
+                zi = np.asarray(self._solve_for_z(dt_d, wi, yi, C), dtype=float)
 
                 # check for convergence
                 if zi_prev is not None:
@@ -252,11 +262,13 @@ class ALS:
                     numer = np.asarray(zi - zi_prev)
                     if (np.linalg.norm(numer) / denom) < self.tolerance:
                         break
+
                 # if not, continue on iterating
                 zi_prev = zi
                 # Update asymmetric weights
                 residual = yi - zi
                 positive_resid = residual > 0
+
                 # determine if in peak region: p_local, else: 1 - p_local
                 wi = np.where(positive_resid, p_local, 1.0 - p_local)
                 # Prevent weights being zero
