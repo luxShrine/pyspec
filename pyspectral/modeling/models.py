@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, override
 
 from beartype import beartype
 from jaxtyping import Bool, Float, jaxtyped
+from loguru import logger
 import numpy as np
 import torch
 from torch import Tensor, nn
@@ -20,8 +23,100 @@ type FeatTensor = Float[Tensor, "B T D"]
 type ReFeatTensor = Float[Tensor, "B D T"]
 type MaskTensor = Bool[Tensor, "B T"]
 
+type BatchPrep = tuple[tuple[Tensor, ...], Tensor, Tensor | None]
+type ModelOutput = nn.Module | Tensor | tuple | list
+
+
+def _prepare_batch(
+    batch: tuple | list,
+    device: torch.device,
+    model: Model,
+) -> BatchPrep:
+    if len(batch) == 2:
+        spectra, target = batch
+        inputs = (spectra.to(device, non_blocking=True),)
+        return inputs, target.to(device, non_blocking=True), None
+    if len(batch) == 4:
+        feats, mask, target, scene_idx = batch
+        feats = feats.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        if isinstance(model, MILMeanHead) or isinstance(model, MILMeanHeadMulti):
+            inputs = (feats, mask)
+        else:
+            inputs = (feats,)
+        return inputs, target, scene_idx
+    raise TypeError(f"Unsupported batch structure of length {len(batch)}")
+
+
+def _prediction_from_output(output: ModelOutput) -> Tensor:
+    """Unpack model outputs, returning the tensor used for loss/pred storage."""
+    if isinstance(output, Tensor):
+        return output
+    if isinstance(output, (tuple, list)):
+        first = output[0]
+        if isinstance(first, Tensor):
+            return first
+    raise TypeError(f"Unsupported model output type: {type(output)}")
+
+
+def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
+    """Check that input is a tensor, return said tensor or raise TypeError."""
+    if isinstance(maybe_tens, Tensor):
+        return maybe_tens
+    else:
+        raise TypeError(f"Input is not a tensor: {type(maybe_tens)}")
+
+
 # -- multiple-instance learning model
 # replace with max/noisy-OR/attention if they are better
+
+
+class MILMeanHeadMulti(nn.Module):
+    """Predict each pixel, yes, no, maybe."""
+
+    def __init__(self, d_in: int, hidden: int = 64, n_classes: int = 3):
+        super().__init__()
+        self.n_classes: int = n_classes
+        self.ff: nn.Sequential = nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_classes),  # per-pixel logits for C classes
+        )
+
+    def prepare(self, batch: tuple | list, device: torch.device) -> BatchPrep:
+        return _prepare_batch(batch, device, self)
+
+    @jaxtyped(typechecker=beartype)
+    @override
+    def forward(
+        self,
+        X: FeatTensor,  # (B, T, D)
+        mask: MaskTensor,  # (B, T), bool
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Returns:
+            bag_logits: (B, C)    # for CrossEntropyLoss
+            pix_logits: (B, T, C) # per-pixel logits
+        """
+        if torch.isnan(X).any() or torch.isinf(X).any():
+            raise ValueError("Non-finite features in X")
+
+        pix_logits: Float[Tensor, "B T C"] = self.ff(X)  # raw logits
+
+        if torch.isnan(pix_logits).any() or torch.isinf(pix_logits).any():
+            raise ValueError("Non-finite logits pix_logits")
+
+        # masked mean pooling over T -> bag-level logits
+        mask_f = mask.float().unsqueeze(-1)  # (B, T, 1)
+        denom: Float[Tensor, "B 1"] = mask_f.sum(dim=1).clamp_min(1.0)
+        bag_logits: Float[Tensor, "B C"] = (pix_logits * mask_f).sum(dim=1) / denom
+
+        return bag_logits, pix_logits
+
+    def pred(self, input: tuple[Tensor, ...]) -> Tensor:
+        return _prediction_from_output(self(*input))
 
 
 class MILMeanHead(nn.Module):
@@ -33,6 +128,9 @@ class MILMeanHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, 1),  # per-pixel logit
         )
+
+    def prepare(self, batch: tuple | list, device: torch.device) -> BatchPrep:
+        return _prepare_batch(batch, device, self)
 
     @jaxtyped(typechecker=beartype)
     @override
@@ -57,6 +155,9 @@ class MILMeanHead(nn.Module):
         num = xnum.sum(dim=1)
         prob: Float[Tensor, "B"] = num / denom  # (B,)
         return prob, z, p
+
+    def pred(self, input: tuple[Tensor, ...]) -> Tensor:
+        return _prediction_from_output(self(*input))
 
 
 # -- conv model
@@ -106,6 +207,9 @@ class ConvSpectralClassifier(nn.Module):
             nn.Linear(linear1_out, c_out),
         )
 
+    def prepare(self, batch: tuple | list, device: torch.device) -> BatchPrep:
+        return _prepare_batch(batch, device, self)
+
     @jaxtyped(typechecker=beartype)
     @override
     def forward(self, x: BatchTensor) -> ClassTensor:
@@ -116,8 +220,11 @@ class ConvSpectralClassifier(nn.Module):
         y: ClassTensor = self.head(features)
         return y
 
+    def pred(self, input: tuple[Tensor, ...]) -> Tensor:
+        return _prediction_from_output(self(*input))
 
-type ClassMapper = ConvSpectralClassifier | MILMeanHead
+
+type ClassMapper = ConvSpectralClassifier | MILMeanHead | MILMeanHeadMulti
 # -- Low Rank, less complexity less memory
 
 
@@ -132,6 +239,9 @@ class LowRankSpectralMapper(nn.Module):
         nn.init.normal_(self.V, std=1e-3)
         nn.init.normal_(self.U, std=1e-3)
         self.bias: nn.Parameter = nn.Parameter(torch.zeros(c_in))
+
+    def prepare(self, batch: tuple | list, device: torch.device) -> BatchPrep:
+        return _prepare_batch(batch, device, self)
 
     @jaxtyped(typechecker=beartype)
     @override
@@ -152,6 +262,9 @@ class LowRankSpectralMapper(nn.Module):
         # broadcast bias (C,)
         y_flat: Float[Tensor, "B u 1 1"] = x + corr + self.bias
         return y_flat.squeeze(-1).squeeze(-1)
+
+    def pred(self, input: tuple[Tensor, ...]) -> Tensor:
+        return _prediction_from_output(self(*input))
 
 
 class LowRankIdentityPenalty(nn.Module):
@@ -192,10 +305,16 @@ class LinearSpectralMapper(nn.Module):
                 self.proj.weight[i, i, 0, 0] = 1.0
             nn.init.zeros_(self.proj_bias)
 
+    def prepare(self, batch: tuple | list, device: torch.device) -> BatchPrep:
+        return _prepare_batch(batch, device, self)
+
     @jaxtyped(typechecker=beartype)
     @override
     def forward(self, x: BatchTensor) -> BatchTensor:
         return get_tensor(self.proj(x))
+
+    def pred(self, input: tuple[Tensor, ...]) -> Tensor:
+        return _prediction_from_output(self(*input))
 
 
 def init_linear_map(
@@ -360,6 +479,10 @@ def get_model(
                     device
                 )
                 penalty = Penalty(None)
+            case ClassModelType.MILMULTI:
+                d_in = goal.d_in
+                model = MILMeanHeadMulti(d_in, goal.hidden).to(device)
+                penalty = Penalty(None)
             case ClassModelType.MIL:
                 d_in = goal.d_in
                 model = MILMeanHead(d_in, goal.hidden).to(device)
@@ -375,8 +498,8 @@ def get_loss_managers(
     lr: float = 5e-4,
     wd: float = 1e-4,
 ) -> tuple[nn.CrossEntropyLoss | nn.BCELoss | nn.MSELoss, torch.optim.Optimizer]:
-    """Create the optimizer and loss function directly from object."""
-    if isinstance(model, ConvSpectralClassifier):
+    """Create the optimizer and loss function."""
+    if isinstance(model, ConvSpectralClassifier) or isinstance(model, MILMeanHeadMulti):
         loss_fn = nn.CrossEntropyLoss()
     elif isinstance(model, MILMeanHead):
         loss_fn = nn.BCELoss()
@@ -395,14 +518,21 @@ class TrainSetup:
     model: Model
     penalty: Penalty
 
+    def log_init(self, fold: int) -> None:
+        if fold == 1:
+            details = f"model type: {self.model} \n"
+            details += f"loss function: {self.loss_fn} | optimizer: {self.optimizer}\n"
+            logger.debug(details)
 
-def get_train_setup(
-    c_in: int,
-    device: torch.device,
-    lr: float,
-    wd: float,
-    goal: ClassCfg | SpectraCfg,
-) -> TrainSetup:
-    model, penalty = get_model(goal=goal, c_in=c_in, device=device)
-    loss_fn, optimizer = get_loss_managers(model, lr, wd)
-    return TrainSetup(loss_fn, optimizer, model, penalty)
+    @classmethod
+    def get_train_setup(
+        cls,
+        c_in: int,
+        device: torch.device,
+        lr: float,
+        wd: float,
+        goal: ClassCfg | SpectraCfg,
+    ) -> TrainSetup:
+        model, penalty = get_model(goal=goal, c_in=c_in, device=device)
+        loss_fn, optimizer = get_loss_managers(model, lr, wd)
+        return cls(loss_fn, optimizer, model, penalty)
