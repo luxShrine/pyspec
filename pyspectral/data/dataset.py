@@ -123,21 +123,27 @@ class KFolds:
         for tr_s, va_s in skf.split(np.zeros(num_scenes), y_scene):
             yield tr_s.astype(np.int64), va_s.astype(np.int64)
 
-    def scene_cv_pixel_indices(self, arts: DataArtifacts):
-        y_scene = np.asarray(arts.presences, dtype=int)  # shape (Scenes,)
+    def scene_cv_pixel_indices(
+        self, arts: DataArtifacts
+    ) -> Generator[KfoldPixIndices, None, None]:
+        # binary stratifying on presence mean >= 0.5
+        # could also be p.map.any(), which would find if the map
+        # has any presences
+        strat = [int(p.map.mean() > 0.5) for p in arts.presences]
+        y_scene = np.asarray(strat, dtype=np.int64)  # shape (Scenes,)
         num_scenes = len(arts.scene_ids)
         skf = StratifiedKFold(
             n_splits=self.n_splits, shuffle=True, random_state=self.random_state
         )
         for tr_s, va_s in skf.split(np.zeros(num_scenes), y_scene):
-            tr_idx = np.concatenate(
+            tr_idx: np.ndarray[tuple[int], np.dtype[np.int64]] = np.concatenate(
                 [
                     np.arange(sl.start, sl.stop)
                     for s in tr_s
                     for sl in [arts.scene_slice(s)]
                 ]
             )
-            va_idx = np.concatenate(
+            va_idx: np.ndarray[tuple[int], np.dtype[np.int64]] = np.concatenate(
                 [
                     np.arange(sl.start, sl.stop)
                     for s in va_s
@@ -152,7 +158,7 @@ class KFolds:
 type SpectralData = tuple[torch.Tensor, torch.Tensor]
 
 
-class PixelSpectraDataset(Dataset[SpectralData]):
+class SpecSpecDataset(Dataset[SpectralData]):
     """Dataset for operating on individual spectra data, pixel by pixel."""
 
     def __init__(self, X: ArrayF32, Y: ArrayF32):
@@ -170,7 +176,7 @@ class PixelSpectraDataset(Dataset[SpectralData]):
         return X, Y
 
 
-def build_spec_datasets(n_splits: int, data: SpectraPair, arts: DataArtifacts):
+def build_spec_datasets(n_splits: int, data: SpectraPair):
     # per-pixel features
     raw = data.X_raw.astype(np.float32)  # (N,C)
     prc = data.Y_proc.astype(np.float32)  # (N,C)
@@ -187,23 +193,97 @@ def build_spec_datasets(n_splits: int, data: SpectraPair, arts: DataArtifacts):
         fold_stat = FoldStat.from_subset(raw[tr_s], prc[tr_s], raw[te_s], prc[te_s])
 
         # must recreate model, datasets & loaders each fold
-        train_ds = PixelSpectraDataset(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
-        test_ds = PixelSpectraDataset(fold_stat.te_x_znorm.z, fold_stat.te_y_znorm.z)
+        train_ds = SpecSpecDataset(fold_stat.tr_x_znorm.z, fold_stat.tr_y_znorm.z)
+        test_ds = SpecSpecDataset(fold_stat.te_x_znorm.z, fold_stat.te_y_znorm.z)
 
         yield (train_ds, tr_s), (test_ds, te_s), fold_stat
 
 
 # -- Spectra to Classificaton
 
-type SceneSpectralData = tuple[torch.Tensor, torch.Tensor, int]
+type ClassSpectralData = tuple[torch.Tensor, torch.Tensor, int]
 
 
-class SceneSpectralDataset(Dataset[SceneSpectralData]):
+class PixelSpectraDataset(Dataset[ClassSpectralData]):
     """
-    __getitem__(i) -> (X_i, y_i, scene_idx)
-       X_i : (T_i, D) float32, all pixel features for scene i
-       y_i : ()        float32 scalar {0,1}
-       scene_idx : int index into arts.scene_ids
+    X_i: (D,)               float32, pixel features for pixel i
+    y_i: ()                 float32 scalar {0,1,2}
+    pixel_ids (M,):         indicies into feats
+    scene_of_pixel (N,):    maps global pixel -> scene_idx
+
+    getitem[i] -> (X_i, y_i, scene_idx)
+    """
+
+    def __init__(
+        self,
+        feats: np.ndarray[tuple[int]],
+        arts: DataArtifacts,
+        pixel_ids: np.ndarray[tuple[int]],
+        scene_of_pixel: np.ndarray[tuple[int]],
+    ):
+        self.feats: np.ndarray[tuple[int], np.dtype[np.float32]] = feats.astype(
+            np.float32, copy=False
+        )
+        self.arts: DataArtifacts = arts
+        self.pixel_ids: np.ndarray[tuple[int]] = pixel_ids
+        self.scene_of_pixel: np.ndarray[tuple[int]] = scene_of_pixel
+
+    def __len__(self) -> int:
+        return self.pixel_ids.size
+
+    @override
+    def __getitem__(self, idx: int) -> ClassSpectralData:
+        # global pixel index
+        pixel: int = self.pixel_ids[idx]
+        # which scene this pixel is in
+        scene_index: int = self.scene_of_pixel[pixel]
+
+        # local index within that scene via slice
+        slice = self.arts.slices[scene_index]
+        local_index = pixel - slice.start
+
+        pixel_presence = self.arts.presences[scene_index].map.flatten()[local_index]
+        # NOTE: converts presence from ∈ {0,2} to ∈ {0,1}
+        if pixel_presence == 0:
+            pixel_presence = 0.0
+        elif pixel_presence == 2:
+            pixel_presence = 1.0
+        else:
+            pixel_presence = 0.5  # maybe
+
+        X = torch.from_numpy(self.feats[pixel]).float().contiguous()
+        y = torch.tensor(pixel_presence, dtype=torch.float32)
+        return X, y, scene_index
+
+
+def pixel_collate(batch: list[ClassSpectralData]):
+    """
+    Collate function for pixel-level spectral datasets.
+
+    Args:
+        batch: List of (features, target, scene_idx) tuples where features
+            have shape (D,).
+
+    Returns:
+        feats: Tensor of shape (B, 1, D) suitable for MIL models.
+        mask: Boolean tensor of shape (B, 1) marking valid positions.
+        y: Tensor of shape (B,) with presence targets.
+        scene_idx: Tensor of shape (B,) with scene indices.
+    """
+    feats = torch.stack([b[0] for b in batch], dim=0)  # (B, D)
+    feats = feats.unsqueeze(1)  # (B, 1, D)
+    y = torch.stack([b[1] for b in batch], dim=0)  # (B,)
+    scene_idx = torch.tensor([b[2] for b in batch], dtype=torch.long)
+    mask = torch.ones((feats.shape[0], feats.shape[1]), dtype=torch.bool)
+    return feats, mask, y, scene_idx
+
+
+class SceneSpectralDataset(Dataset[ClassSpectralData]):
+    """
+    getitem[i] -> (X_i, y_i, scene_idx)
+    X_i : (T_i, D) float32, all pixel features for scene i
+    y_i : ()        float32 scalar {0,1}
+    scene_idx : int index into arts.scene_ids
     """
 
     def __init__(self, feats: ArrayF32, arts: DataArtifacts, scene_ids: ArrayI):
@@ -219,11 +299,12 @@ class SceneSpectralDataset(Dataset[SceneSpectralData]):
         scene: int = self.scenes[idx]
         slice = self.arts.scene_slice(scene)
         X = torch.from_numpy(self.feats[slice]).float().contiguous()
-        y = torch.tensor(float(self.arts.presences[scene]), dtype=torch.float32)
+        scene_pres_avg = self.arts.presences[scene].mean
+        y = torch.tensor(scene_pres_avg, dtype=torch.float32)
         return X, y, scene
 
 
-def scene_collate(batch: list[SceneSpectralData]):
+def scene_collate(batch: list[ClassSpectralData]):
     """Pad each differently sized batch to largest batch size.
 
     Args:
@@ -277,10 +358,11 @@ def build_scene_datasets(
 ) -> Generator[tuple[TrainSceneDSIndex, TestSceneDSIndex, DataArtifacts], None, None]:
     arts = data.arts
     # NOTE: assume all scenes share a common wavelength grid
-    wl = arts.wls[0]
+    wl: Arr1DF = arts.wls[0]
 
     # per-pixel features
-    X_pix = data.all_flatmaps  # (N, C) float64
+    X_pix: Arr2DF = data.all_flatmaps  # (N, C)
+    # get features for each n ∈ N, n is each pixel,
     feats = [create_specband_feats(xi, wl, region_set) for xi in X_pix]
     feats = np.vstack(feats).astype(np.float32, copy=False)  # (N, D)
 
@@ -298,3 +380,57 @@ def build_scene_datasets(
         ds_tr = SceneSpectralDataset(F, arts, tr_s)
         ds_te = SceneSpectralDataset(F, arts, te_s)
         yield (ds_tr, tr_s), (ds_te, te_s), arts
+
+
+# -- Pixel dataset helpers
+type TrainPixDSIndex = tuple[PixelSpectraDataset, ClassPixIndices, ClassPixIndices]
+type TestPixDSIndex = tuple[PixelSpectraDataset, ClassPixIndices, ClassPixIndices]
+
+
+def make_scene_of_pixel(
+    arts: DataArtifacts, n_pixels: int
+) -> np.ndarray[tuple[int], np.dtype[np.int64]]:
+    scene_of_pixel = np.empty(n_pixels, dtype=np.int64)
+    for scene_idx, slice in enumerate(arts.slices):
+        # assign the scene index to each slice of pixels
+        scene_of_pixel[slice] = scene_idx
+    return scene_of_pixel
+
+
+def apply_scaler(feats: Arr2DF32, tr_pix_idx: ClassPixIndices):
+    """Fit scaler on training pixels, and apply this fit to all pixels."""
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    scaler.fit(feats[tr_pix_idx])
+
+    # apply fit to all pixels
+    F = np.asarray(scaler.transform(feats), np.float32)
+    return F
+
+
+def build_pix_scene_datasets(
+    n_splits: int,
+    data: ClassPair,  # has all_flatmaps (N,C) and arts
+    region_set: RegionSet,
+    random_state: int = 47,
+) -> Generator[tuple[TrainPixDSIndex, TestPixDSIndex, DataArtifacts], None, None]:
+    arts = data.arts
+    # NOTE: assume all scenes share a common wavelength grid
+    wl: Arr1DF = arts.wls[0]
+
+    # per-pixel features
+    X_pix: Arr2DF = data.all_flatmaps  # (N, C)
+    scene_pixel = make_scene_of_pixel(arts, X_pix.shape[0])
+    # get features for each n ∈ N, n is each pixel
+    flatfeats = [create_specband_feats(xi, wl, region_set) for xi in X_pix]
+    # (N, D)
+    feats: Arr2DF32 = np.vstack(flatfeats).astype(np.float32, copy=False)
+
+    # splits correspond to each scene
+    splits = KFolds(n_splits, X_pix, random_state)
+    for tr_pix_idx, te_pix_idx, tr_s, te_s in splits.scene_cv_pixel_indices(arts):
+        F = apply_scaler(feats, tr_pix_idx)
+
+        ds_tr = PixelSpectraDataset(F, arts, tr_pix_idx, scene_of_pixel=scene_pixel)
+        ds_te = PixelSpectraDataset(F, arts, te_pix_idx, scene_of_pixel=scene_pixel)
+
+        yield (ds_tr, tr_pix_idx, tr_s), (ds_te, te_pix_idx, te_s), arts
