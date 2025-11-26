@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from typing import Any, override
+from typing import override
 
 import numpy as np
-import numpy.typing as npt
 from sklearn.model_selection import (
     GroupKFold,
     KFold,
@@ -15,12 +14,22 @@ from sklearn.preprocessing import StandardScaler
 import torch
 from torch.utils.data import Dataset
 
-from pyspectral.config import ArrayF, ArrayF32, ArrayI, IndexArray
 from pyspectral.core import FlatMap
 from pyspectral.data.features import FoldStat, RegionSet, create_specband_feats
 from pyspectral.data.io import ClassPair, DataArtifacts, SpectraPair
+from pyspectral.types import (
+    Arr1DF,
+    Arr2DF,
+    Arr2DF32,
+    ArrayF,
+    ArrayF32,
+    ArrayI,
+    ClassPixIndices,
+    IndexArray,
+    KfoldPixIndices,
+    SplitIter,
+)
 
-type SplitIter = Generator[tuple[IndexArray, IndexArray]]
 type CrossValidator = KFold | GroupKFold | StratifiedGroupKFold | StratifiedKFold
 
 

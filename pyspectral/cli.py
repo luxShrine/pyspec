@@ -1,4 +1,4 @@
-from pyspectral.config import DATA_DIR, RAW_DATA_DIR, READY_DATA_DIR
+from pyspectral.config import DATA_DIR
 import pyspectral.data.io as pi
 
 

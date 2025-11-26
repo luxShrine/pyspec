@@ -28,52 +28,8 @@ MODELS_DIR: Path = PROJ_ROOT / "models"
 REPORTS_DIR: Path = PROJ_ROOT / "reports"
 FIGURES_DIR: Path = REPORTS_DIR / "figures"
 
-# -- types & defaults ----------------------------------------------------
-
-
-type ArrayF = npt.NDArray[np.float64]
-type ArrayF32 = npt.NDArray[np.float32]
-type ArrayI = npt.NDArray[np.int64]
-type IndexArray = npt.NDArray[np.intp]
-Std = NewType("Std", float)
-Mean = NewType("Mean", float)
-StdArray = NewType("StdArray", npt.NDArray[np.float32])
-MeanArray = NewType("MeanArray", npt.NDArray[np.float32])
-
 RNG = np.random.default_rng(42)
-
-
-class SpectralMode(StrEnum):
-    RAMAN = auto()
-    REFLECTANCE = auto()  # alternative method not used
-
-
-class PlotType(StrEnum):
-    TRAIN = auto()
-    TEST = auto()
-    BOTH = auto()
-
-
-class SpecModelType(StrEnum):
-    LSM = auto()
-    LRSM = auto()
-
-
-class ClassModelType(StrEnum):
-    MIL = auto()
-    CONV = auto()
-
-
-# -- physics types -------------------------------------------------------
-
 REF_PHE = 1003.0
-
-
-class SetType(StrEnum):
-    PROCESSED = auto()
-    RAW = auto()
-    UNKNOWN = auto()
-
 
 # with tqdm installed, configure loguru with tqdm.write
 # https://github.com/Delgan/loguru/issues/135

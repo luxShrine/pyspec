@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum, auto
-from pathlib import Path
-from typing import Any, NewType
+from typing import Any, TypedDict
 
-from dotenv import load_dotenv
-from loguru import logger
 import numpy as np
 import numpy.typing as npt
 
-from pyspectral.config import ArrayF, ArrayF32, MeanArray, StdArray
+from pyspectral.types import (
+    Arr1DF,
+    Arr2DF,
+    Arr3DF32,
+    ArrayF,
+    ArrayF32,
+    MeanArray,
+    StdArray,
+)
 
 
 def apply_z(y: np.ndarray, mean: MeanArray, std: StdArray) -> np.ndarray:

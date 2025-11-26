@@ -11,15 +11,21 @@ from scipy import sparse
 from scipy.signal import find_peaks, medfilt, savgol_filter
 from scipy.sparse.linalg import spsolve
 
-from pyspectral.config import (
+from pyspectral.core import Cube, FlatMap
+from pyspectral.types import (
+    Arr1DF,
+    Arr2DF,
     ArrayF,
     ArrayF32,
+    BaselinePolynomialDegree,
     SpectralMode,
 )
-from pyspectral.core import Cube, FlatMap
+
+type BaselineMethod = BaselinePolynomialDegree | ALS | None
+DEFAULT_BASE_POLY = BaselinePolynomialDegree(2)
 
 
-def _median_spike_removal(y: FlatMap, k: int | None) -> ArrayF32:
+def _median_spike_removal(y: FlatMap, k: int | None) -> Arr2DF:
     """Apply 1D median filter of window k to each spectrum (rows of y)."""
     if k is None:
         logger.debug("No median spike removal pre-processing done.")
@@ -33,7 +39,7 @@ def _median_spike_removal(y: FlatMap, k: int | None) -> ArrayF32:
     return out
 
 
-def _poly_baseline_subtract(y: ArrayF32, wl: ArrayF, degree: int | None) -> ArrayF32:
+def _poly_baseline_subtract(y: ArrayF, wl: ArrayF, degree: int | None) -> ArrayF:
     """Fit polynomial baseline per spectrum; subtract it."""
     if degree is None:
         logger.debug("No baseline subtraction done.")
@@ -54,11 +60,11 @@ def _poly_baseline_subtract(y: ArrayF32, wl: ArrayF, degree: int | None) -> Arra
 
 
 def normalize_to_peak(
-    y: ArrayF32,
+    y: np.ndarray,
     wl: ArrayF,
     center: float,
     halfwidth: float,
-) -> ArrayF32:
+) -> ArrayF:
     """Divide by max value in a small window around `center`."""
     mask = (wl >= (center - halfwidth)) & (wl <= (center + halfwidth))
     idx = np.flatnonzero(mask)
@@ -69,7 +75,7 @@ def normalize_to_peak(
             + f"given wl range [{wl.min()}, {wl.max()}]. Check units and peak center."
         )
     denom = y[:, mask].max(axis=1, keepdims=True) + 1e-8
-    return (y / denom).astype(np.float32)  # type: ignore
+    return y / denom
 
 
 def _refine_peak_center(wl: ArrayF, y: ArrayF, i: int) -> float:
@@ -130,10 +136,8 @@ class SmoothCfg:
                 f"Smooth polynomial value must be within range of (1-10), found {self.poly=}"
             )
 
-    def smooth(self, y: ArrayF32) -> ArrayF32:
-        return savgol_filter(
-            y, window_length=self.window, polyorder=self.poly, axis=1
-        ).astype(np.float32)
+    def smooth(self, y: np.ndarray) -> ArrayF:
+        return savgol_filter(y, window_length=self.window, polyorder=self.poly, axis=1)
 
 
 @dataclass
@@ -157,7 +161,7 @@ class ALS:
 
     def remove_baseline(
         self,
-        y: np.ndarray,
+        y: Arr1DF | Arr2DF,
     ) -> tuple[np.ndarray, ArrayF32]:
         """
         Robust baseline via asymmetric least squares (ALS).
@@ -199,13 +203,19 @@ class ALS:
         # Build second-difference operator (D^2), a second derivative to act on z
         # d_op acts as a penalty to non-smooth curves, these high slope regions
         # are likely to be peaks, not a part of the baseline
-        d_op = sparse.diags([1, -2, 1], [0, 1, 2], shape=(C - 2, C), format="csc")
-        dt_d = (d_op.T @ d_op).tocsc()
+        d_op: sparse.dia_matrix = sparse.diags(
+            [1, -2, 1],
+            [0, 1, 2],  # pyright: ignore[reportArgumentType]
+            shape=(C - 2, C),
+            format="csc",
+        )
+        dt_d: sparse.csc_array = (d_op.T @ d_op).tocsc()
 
         # Construct peak mask (shared across rows)
         threshold = np.nanpercentile(Y, MASK_PERCENTILE, axis=-1, keepdims=True)
         mask = (Y > threshold).astype(int)
         kernel = np.ones(2 * MASK_HALF_WIDTH + 1, dtype=int)
+
         # apply: (a * v)_n = \sum_{m = -\infty}^{\infty} a_m v_{n - m} to the rows
         # The convolution finds the overlap between the kernel and the mask of the signal
         mask = np.apply_along_axis(
@@ -219,7 +229,7 @@ class ALS:
         # the current weight w
         Z = np.zeros_like(Y)
         for i in range(Y.shape[0]):
-            yi = Y[i]
+            yi: np.ndarray[tuple[int, ...], np.dtype[np.float64]] = Y[i]
             wi = np.ones(C, dtype=float)  # reset every loop
 
             # Downweight on peak regions, using mask
@@ -257,29 +267,7 @@ class ALS:
         baseline = Z.reshape(orig_shape)
         baseline = np.moveaxis(baseline, -1, axis)
         corrected = np.moveaxis(y.reshape(orig_shape), -1, axis) - baseline
-        return baseline, corrected
-
-
-BaselinePolynomialDegree = NewType("BaselinePolynomialDegree", int)
-type BaselineMethod = BaselinePolynomialDegree | ALS | None
-DEFAULT_BASE_POLY = BaselinePolynomialDegree(2)
-
-# if isinstance(baseline_method, int):
-#     pre_config = PreConfig.make_poly(
-#         spike_kernel_size=spike_k,
-#         baseline_poly=baseline_method,
-#         s_poly=s_poly,
-#         s_window=s_window,
-#     )
-# elif isinstance(baseline_method, ALS):
-#     pre_config = PreConfig.make_als(
-#         smoothness=baseline_method.smoothness,
-#         asymmetry=baseline_method.asymmetry,
-#         n_iter=baseline_method.n_iter,
-#         tolerance=baseline_method.tolerance,
-#     )
-# else:
-#     pre_config = PreConfig.make_min()
+        return baseline, corrected.astype(np.float32)
 
 
 @dataclass
@@ -382,8 +370,8 @@ class GlobalPeakNorm:
 
     @staticmethod
     def normalize(
-        y: ArrayF32,
-    ) -> ArrayF32:
+        y: ArrayF,
+    ) -> ArrayF:
         """Preform a global normalization."""
         min = np.min(y)
         num = y - min
@@ -413,7 +401,7 @@ class PreprocStats:
 
 
 type NormResult = tuple[
-    ArrayF32, PreprocStats | None, int | float | None, int | float | None
+    ArrayF, PreprocStats | None, int | float | None, int | float | None
 ]
 
 
@@ -425,7 +413,7 @@ class PeakNormConfig:
 
     def fit_preproc(
         self,
-        Y_train: ArrayF32,  # (N_train, M), after spike/baseline/smoothing
+        Y_train: ArrayF,  # (N_train, M), after spike/baseline/smoothing
         wl_cm1: ArrayF,  # (M,)
     ) -> PreprocStats:
         match self.mode:
@@ -441,7 +429,7 @@ class PeakNormConfig:
                 return PreprocStats(None, None)
 
     def normalize(
-        self, cube_maybe: Cube | CubeStats, y: ArrayF32, wl_cm1: ArrayF
+        self, cube_maybe: Cube | CubeStats, y: np.ndarray, wl_cm1: ArrayF
     ) -> NormResult:
         ref_center = None
         ref_halfw = None

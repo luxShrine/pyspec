@@ -5,10 +5,41 @@ from typing import Literal
 
 from loguru import logger
 import numpy as np
+import numpy.typing as npt
 from numpy.typing import DTypeLike
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
-from pyspectral.config import REF_PHE, ArrayF, ArrayF32, MeanArray, StdArray
+from pyspectral.config import REF_PHE
 from pyspectral.core import apply_z
+from pyspectral.types import (
+    Arr1DF,
+    ArrayF,
+    ArrayF32,
+    MeanArray,
+    StdArray,
+    UnitFloat,
+)
+
+# -- general helpers -------------------------------------------------------
+
+
+def _filter_array(
+    array: ArrayF, wl: ArrayF, lower_bound: float, upper_bound: float
+) -> tuple[ArrayF, ArrayF]:
+    mask = (wl >= lower_bound) & (wl <= upper_bound)
+    if not np.any(mask):
+        return np.empty(0, dtype=array.dtype), np.empty(0, dtype=array.dtype)
+    return array[..., mask], wl[mask]
+
+
+def _area_under_curve(y: ArrayF, x: ArrayF) -> float:
+    if y.size < 2:
+        return np.nan
+    return float(np.trapezoid(y, x))
+
+
+# -- per fold details -------------------------------------------------------
 
 
 def fit_diag_affine(x_std: ArrayF32, y_std: ArrayF32) -> tuple[ArrayF, ArrayF]:

@@ -10,14 +10,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from pyspectral.config import (
-    ArrayF,
-    ArrayF32,
-    ArrayI,
-    ClassModelType,
-    IndexArray,
-    SpecModelType,
-)
+from pyspectral.core import TestResult
 from pyspectral.data.dataset import (
     KFolds,
     PixelSpectraDataset,
@@ -27,14 +20,16 @@ from pyspectral.data.dataset import (
 )
 from pyspectral.data.features import FoldStat, RegionSet
 from pyspectral.data.io import ClassPair, DataArtifacts, SpectraPair
-from pyspectral.modeling.models import (
-    BandPenalty,
-    ClassCfg,
-    MILMeanHead,
-    Model,
-    Penalty,
-    SpectraCfg,
-    get_train_setup,
+import pyspectral.modeling.models as pm
+import pyspectral.modeling.oof as oof
+from pyspectral.types import (
+    Arr1DF,
+    ArrayF,
+    ArrayF32,
+    ArrayI,
+    ClassModelType,
+    IndexArray,
+    SpecModelType,
 )
 
 
@@ -276,7 +271,7 @@ def _prediction_from_output(output: nn.Module | Tensor | tuple | list) -> Tensor
 
 
 def _pred_to_numpy(pred: Tensor) -> ArrayF32:
-    arr = pred.detach().cpu().numpy().astype(np.float32, copy=False)
+    arr: ArrayF32 = pred.detach().cpu().numpy().astype(np.float32, copy=False)
     while arr.ndim > 1 and arr.shape[-1] == 1:
         arr = arr.squeeze(-1)
     return arr
@@ -306,11 +301,11 @@ def _prepare_batch(
 
 def train_epoch(
     dataloader: DataLoader,
-    model: Model,
+    model: pm.Model,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    penalty: Penalty,
+    penalty: pm.Penalty,
 ) -> float:
     """Run a single training epoch and return the average batch loss.
 
@@ -350,7 +345,7 @@ def train_epoch(
 @torch.no_grad()
 def test_epoch(
     loader: DataLoader,
-    model: Model,
+    model: pm.Model,
     loss_fn: nn.Module,
     device: torch.device,
 ) -> TestResult:
@@ -368,7 +363,7 @@ def test_epoch(
     model.eval()
     vl_loss = total_improv = 0.0
     n_total = 0
-    preds_fold = []
+    preds_fold: list[ArrayF32] = []
     for batch in loader:
         inputs, target, _ = _prepare_batch(batch, device, model)
         pred = _prediction_from_output(model(*inputs))

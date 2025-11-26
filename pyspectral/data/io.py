@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, replace
 import json
 from pathlib import Path
 from typing import Any, TypedDict
@@ -9,14 +9,7 @@ from loguru import logger
 import numpy as np
 import polars as pl
 
-from pyspectral.config import (
-    RAW_DATA_DIR,
-    READY_DATA_DIR,
-    RNG,
-    ArrayF,
-    ArrayF32,
-    ArrayI,
-)
+from pyspectral.config import READY_DATA_DIR
 from pyspectral.core import Cube, FlatMap, assert_same_grid
 from pyspectral.data.preprocessing import (
     PeakNormConfig,
@@ -24,6 +17,12 @@ from pyspectral.data.preprocessing import (
     PreprocStats,
     SameGridCubes,
     preprocess_cube,
+)
+from pyspectral.types import (
+    Arr1DF,
+    Arr2DF,
+    ArrayF,
+    ArrayI,
 )
 
 # -- data helpers
@@ -122,32 +121,90 @@ class SafeData:
         return cls(df=df, optional_col=get_optional, base_dir=base, data_file=csv)
 
 
+class PresenceType:
+    def __init__(self, value: int | float | bool):
+        self.v: np.float64 = self.create(value)
+
+    @classmethod
+    def create(cls, potential: int | float | bool) -> np.float64:
+        if potential < 0:
+            raise ValueError(
+                f"Input passed to create presence type was negative: {potential}"
+            )
+        if potential > 3:
+            raise ValueError(
+                f"Input passed to create presence type was greater than three: {potential}"
+            )
+        return np.float64(potential)
+
+
+@dataclass(frozen=True, slots=True)
+class Presence:
+    """
+    mean: mean presence value across the map
+    map: presence values per pixel of the map
+    """
+
+    mean: np.float64
+    map: np.ndarray[tuple[int, int], np.dtype[np.float64]]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Presence:
+        mean = PresenceType(d["mean"])
+        map_arr = np.asarray(d["map"], dtype=np.float64)
+        if (map_arr < 0).any() or (map_arr > 3).any():
+            raise ValueError("Presence map values must be in [0, 3]")
+        return cls(mean=mean.v, map=map_arr)
+
+    @staticmethod
+    def create_map(h: int, w: int, presence: int) -> np.ndarray[tuple[int, int]]:
+        """
+        Project out a single value, by labeling each point on the map as
+        equal to this value
+        """
+        return np.repeat([presence], (h * w)).reshape((h, w))
+
+
 class PreArts(TypedDict):
     hw: list[tuple[int, int]]
-    wls: list[ArrayF]
+    wls: list[Arr1DF]
     pre_stats: list[PreprocStats]
-    flats: list[ArrayF32]
-    presences: list[bool]
+    flats: list[Arr2DF]
+    presences: list[Presence]
 
 
 @dataclass(frozen=True)
 class DataArtifacts:
-    scene_ids: ArrayI  # shape (S,)
-    preprocess_stats: list[PreprocStats]  # one per scene
-    pre_config: PreConfig  # the preproc parameters used
-    wls: list[ArrayF]  # common wl per scene
-    presences: list[bool]  # presence per scene
-    lengths: ArrayI  # per-scene pixel counts (H*W)
-    hw: ArrayI  # shape (S,2): (H,W) per scene
-    slices: list[slice]  # slice per scene into flat arrays
-    pixel_to_scene: ArrayI  # length N: global pixel -> scene index [0..S)
-    coords: ArrayI  # shape (N,2): (row,col) for each pixel
+    """
+    scene_ids: integer array shape (S,), length is the number of scenes
+    preprocess_stats: list of PreprocStats, one per scene
+    pre_config: the preprocessing parameters used
+    wls: array of floats, denoting common wl per scene
+    presences: Presence maps denoting presence per scene
+    lengths: integer array (H*W) per-scene pixel counts
+    hw: integer array shape (S,2): (H,W) per scene
+    slices: slices per scene into flat arrays
+    pixel_to_scene: integer array of length N, maps global pixel -> scene index [0..S]
+    coords: integer array shape (N,2), (row,col) for each pixel
+    """
+
+    scene_ids: ArrayI
+    preprocess_stats: list[PreprocStats]
+    pre_config: PreConfig
+    wls: list[Arr1DF]
+    presences: list[Presence]
+    lengths: ArrayI
+    hw: ArrayI
+    slices: list[slice]
+    pixel_to_scene: np.ndarray[tuple[int], np.dtype[np.intp]]
+    coords: np.ndarray[tuple[int, int], np.dtype[np.int64]]
 
     def scene_slice(self, scene_idx: int) -> slice:
         return self.slices[scene_idx]
 
-    def scene_of(self, global_idx: ArrayI) -> ArrayI:
-        return self.pixel_to_scene[global_idx]
+    def scene_of(self, global_idx: int) -> ArrayI:
+        x = self.pixel_to_scene[global_idx]
+        return x
 
     def reshape_scene(self, arr_flat: ArrayF, scene_idx: int) -> ArrayF:
         sl = self.slices[scene_idx]
@@ -205,7 +262,7 @@ class HSIMap:
     xy: (N, 2) float64 stage coords
     spectra: (N, C) float32 intensities
     cube: (H, W, M) float32 reshaped spectral cube
-    presence:
+    presence: Boolean of whether the sample contains alginate, or Presence obj
     _version: float corresponding to HSI schema
     """
 
@@ -213,8 +270,8 @@ class HSIMap:
     xy: ArrayF
     spectra: FlatMap
     cube: Cube
-    presence: bool
-    _version: float = 0.2
+    presence: Presence
+    _version: float = 0.3
 
     def check_same_wavelength_grid(
         self,
@@ -235,7 +292,7 @@ class HSIMap:
     def from_txt(
         cls,
         txt_path: Path,
-        presence: bool,
+        presence: Presence,
         acq_time_s: float | None = None,
         accumulation: int | None = None,
     ) -> HSIMap:
@@ -465,7 +522,7 @@ def convert_raw_class(csv: str | Path, base: str | Path) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ClassPair:
-    all_flatmaps: ArrayF
+    all_flatmaps: Arr2DF
     arts: DataArtifacts
 
 
@@ -518,7 +575,7 @@ def build_classification(
         pre_arts["flats"].append(flat.get())
         pre_arts["pre_stats"].append(stats)
 
-    x_all = np.vstack(pre_arts["flats"], dtype=np.float64)
+    x_all: Arr2DF = np.vstack(pre_arts["flats"], dtype=np.float64)
 
     arts = build_artifacts(
         pre_config,

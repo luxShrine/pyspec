@@ -7,17 +7,8 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from pyspectral.config import ArrayF32, ClassModelType, SpecModelType
 from pyspectral.data.features import FoldStat
-
-
-def get_tensor(maybe_tens: Tensor | Any) -> Tensor:
-    """Check that input is a tensor, return said tensor or raise TypeError."""
-    if isinstance(maybe_tens, Tensor):
-        return maybe_tens
-    else:
-        raise TypeError(f"Input is not a tensor: {type(maybe_tens)}")
-
+from pyspectral.types import ArrayF32, ClassModelType, SpecModelType
 
 # tensor dimension checks
 type BatchTensor = Float[Tensor, "B C"]
