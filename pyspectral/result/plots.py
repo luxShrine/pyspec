@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Literal
 
 from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
@@ -10,9 +11,18 @@ from scipy.ndimage import binary_erosion, uniform_filter, zoom
 from skimage.filters import threshold_otsu
 from skimage.morphology import reconstruction
 
-from pyspectral.config import REF_PHE, ArrayF, ArrayF32, PlotType
+from pyspectral.config import REF_PHE
 from pyspectral.core import Cube
-from pyspectral.modeling.predict import ClassicalPredict, FoldPlot, PredictData
+from pyspectral.result.compare import ClassicalPredict, FoldPlot, MLSVMPlot
+from pyspectral.result.predict import PredictData
+from pyspectral.types import (
+    Arr1DF,
+    ArrayF,
+    ArrayF32,
+    Numeric,
+    PlotType,
+    UnitFloat,
+)
 
 # -- figure count helper
 
@@ -34,6 +44,17 @@ def _get_figure_size(number_plots: int) -> tuple[int, int]:
     # if above checks fail, just return sensible default, round up
     rows = (number_plots / MAX_COLUMNS_PER_LINE).__ceil__()
     return rows, MAX_COLUMNS_PER_LINE
+
+
+# -- helper
+
+
+def _build_loss_plot(loss_type: str | None = None):
+    loss_type = f"({loss_type})" if loss_type is not None else ""
+    plt.ylabel(f"Loss {loss_type}")
+    plt.xlabel("Epochs (count)")
+    plt.legend()
+    plt.title("Train & Test Loss over Epochs")
 
 
 # -- Boundary
@@ -138,7 +159,7 @@ def rmse_per_pixel(cube_a: Cube | ArrayF32, cube_b: Cube | ArrayF32) -> ArrayF32
         cube_a = cube_a.get()
     if isinstance(cube_b, Cube):
         cube_b = cube_b.get()
-    return np.sqrt(((cube_a - cube_b) ** 2).mean(axis=-1, dtype=np.float32))  # type: ignore
+    return np.sqrt(((cube_a - cube_b) ** 2).mean(axis=-1, dtype=np.float32))
 
 
 def overlay_boundary(base_img: ArrayF, boundary: ArrayF, title: str, ax: Axes) -> None:
@@ -149,7 +170,12 @@ def overlay_boundary(base_img: ArrayF, boundary: ArrayF, title: str, ax: Axes) -
     """
     ax.imshow(base_img, cmap="gray")
     overlay = np.zeros((*boundary.shape, 4), float)
-    overlay[boundary] = (1.0, 0.0, 0.0, 0.9)  # red edges
+    overlay[boundary] = (  # pyright: ignore[reportCallIssue, reportArgumentType]
+        1.0,
+        0.0,
+        0.0,
+        0.9,
+    )  # red edges
     ax.imshow(overlay)
     ax.set_title(title)
     ax.set_axis_off()
@@ -224,13 +250,12 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
 
     n = len(imgs)
     r, c = _get_figure_size(n)
-    figsize = (4.2 * n, 4)
     _fig, axes = plt.subplots(r, c, dpi=200)
-    axes: list[Axes] = np.atleast_1d(axes).flatten().tolist()
+    axes: list[Axes] = np.atleast_1d(axes).flatten().tolist()  # pyright: ignore[reportCallIssue, reportArgumentType]
     for ax, (base, edge, title) in zip(axes, imgs):
-        ax.imshow(base, cmap="gray")
+        ax.imshow(base, cmap="gray")  # pyright: ignore[reportArgumentType]
         if edge is not None:
-            overlay = np.zeros((*edge.shape, 4), float)
+            overlay = np.zeros((*edge.shape, 4), float)  # pyright: ignore[reportCallIssue, reportArgumentType]
             overlay[edge] = (1, 0, 0, 0.9)
             ax.imshow(overlay)
         ax.set_title(title, {"fontsize": 8}, loc="center", wrap=True)
@@ -264,7 +289,7 @@ def filter_plot_type(
     return plot_data
 
 
-def _plot_classic_line(
+def _plot_horiz_line(
     ax: Axes, elasticnet_rmse: float, pcr_rmse: float, epochs: int
 ) -> None:
     """Add horizontal line for PCR/ElasticNet."""
@@ -321,7 +346,7 @@ def plot_loss_comparison_different_axes(
         if te_l is not None:
             axes.plot(te_l, style, label=f"test: {lbl}", color=s_color)
 
-    _plot_classic_line(ax1, class_error.elasticnet_rmse, class_error.pcr_rmse, epochs)
+    _plot_horiz_line(ax1, class_error.elasticnet_rmse, class_error.pcr_rmse, epochs)
     ax1.legend(loc="center left", bbox_to_anchor=(-1.5, 0.6), fontsize="small")
     ax2.legend(loc="center left", bbox_to_anchor=(1.5, 0.6), fontsize="small")
     fig.show()
@@ -356,7 +381,7 @@ def plot_loss_comparison(
         if te_l is not None:
             ax1.plot(er, te_l, style, label=f"test: {lbl}")
 
-    _plot_classic_line(ax1, class_error.elasticnet_rmse, class_error.pcr_rmse, epochs)
+    _plot_horiz_line(ax1, class_error.elasticnet_rmse, class_error.pcr_rmse, epochs)
 
     ax1.legend(loc="center left", bbox_to_anchor=(1.15, 0.6), fontsize="small")
     plt.show()
@@ -371,3 +396,143 @@ def plot_loss_comparison(
 #     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=data.labels)
 #     disp.plot()
 #     plt.show()
+
+# -- Pixel Plots -------------------------------------------------------
+
+
+def plot_pixel_histogram(
+    pos_pred: np.ndarray,
+    neg_pred: np.ndarray,
+    maybe_pred: np.ndarray,
+    threshold: Numeric = 0.5,
+    bins: int = 50,
+    log_scale: bool = False,
+) -> None:
+    thresh_percent = UnitFloat(threshold)
+    plt.hist(pos_pred, bins=bins, alpha=0.7, label="True pos pixels")
+    plt.hist(maybe_pred, bins=bins, alpha=0.7, label="True class 1 (maybe)")
+    plt.hist(neg_pred, bins=bins, alpha=0.7, label="True neg pixels")
+    plt.axvline(thresh_percent, linestyle="--", label=f"threshold={thresh_percent}")
+    plt.xlabel("Predicted positive probability")
+    plt.ylabel("Pixel count")
+    plt.title("Predicted P(pos) by true class (0/1/2)")
+    plt.legend()
+    plt.legend()
+    plt.tight_layout()
+
+    if log_scale:
+        plt.semilogy()
+
+    plt.show()
+
+
+# -- PCA Components -------------------------------------------------------
+
+
+def plot_pca_components(
+    X_pca: np.ndarray[tuple[int, ...]], y: np.ndarray[tuple[int]]
+) -> None:
+    fig = plt.figure(1, figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d", elev=-160, azim=165)
+
+    scatter = ax.scatter(
+        X_pca[:, 0],
+        X_pca[:, 1],
+        X_pca[:, 2],  # pyright: ignore[reportArgumentType]
+        c=y,
+        s=8,
+    )
+
+    ax.set(
+        title="First three PCA dimensions",
+        xlabel="1st Eigenvector",
+        ylabel="2nd Eigenvector",
+        zlabel="3rd Eigenvector",
+    )
+    ax.xaxis.set_ticklabels([])
+    ax.yaxis.set_ticklabels([])
+    ax.zaxis.set_ticklabels([])
+
+    handles, label_vals = scatter.legend_elements()
+    # the labels spit out latex symbols, so we must clean it out first
+    label_vals = [
+        int(l.replace("$\\mathdefault{", "").replace("}$", "")) for l in label_vals
+    ]
+
+    name_map = {0: "negative", 1: "maybe", 2: "positive"}
+    names = [name_map[v] for v in label_vals]
+
+    legend1 = ax.legend(handles, names, loc="upper right", title="Classes")
+    ax.add_artist(legend1)
+
+    plt.show()
+
+
+def svc_boundary(
+    k: int,
+    w: Arr1DF,
+    b: float,
+    pca_feats: np.ndarray[tuple[int, ...]],
+    y: np.ndarray,
+    *,
+    kernel_type: Literal["linear", "poly", "rbf", "sigmoid", "precomputed"] = "linear",
+):
+    # trained k-D model
+    # mean in PC space, shape (k,)
+    mu: Arr1DF = pca_feats.mean(axis=0)
+
+    # precompute contribution from PCs 3..k
+    c0: np.ndarray = np.dot(w[2:], mu[2:]) + b
+
+    # grid over PC1/PC2
+    X0, X1 = pca_feats[:, 0], pca_feats[:, 1]
+    x_min, x_max = X0.min() - 1, X0.max() + 1
+    y_min, y_max = X1.min() - 1, X1.max() + 1
+    xx, yy = np.meshgrid(
+        np.linspace(x_min, x_max, 200),
+        np.linspace(y_min, y_max, 200),
+    )
+
+    # decision function with PCs 3..k fixed at means
+    zz = w[0] * xx + w[1] * yy + c0
+
+    cmap = "coolwarm"
+    plt.figure(figsize=(8, 6))
+    plt.contourf(xx, yy, zz > 0, cmap=cmap, alpha=0.2)  # regions
+    plt.contour(xx, yy, zz, levels=[0], cmap=cmap)  # boundary f=0
+    plt.scatter(X0, X1, c=y, s=20, cmap=cmap, edgecolor="k", alpha=0.6)
+
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.xticks()
+    plt.yticks()
+    plt.title(f"Slice of {kernel_type} {k}-D SVM hyperplane in PC1–PC2 plane")
+    plt.show()
+
+
+def do_MLSVM_plots(data: MLSVMPlot) -> None:
+    # ML first
+    ml = data.ml_cmp
+    plot_pixel_histogram(ml.pred.pos, ml.pred.neg, ml.pred.maybe)
+
+    # PCA plots
+    pca = data.pca_cmp
+    plot_pixel_histogram(
+        pca.pred.pos, pca.pred.neg, pca.pred.maybe, bins=3, log_scale=True
+    )
+
+    # keep positive & negative
+    svc = data.svc_preds[0]
+    X_pca = svc.X
+    y_full = svc.y
+    y_binary = (y_full == 2.0).astype(int)
+
+    k: int = svc.k
+    w: Arr1DF = svc.w
+    b: float = svc.b
+    plot_pca_components(X_pca, y_full)
+    svc_boundary(k, w, b, X_pca, y_binary)
+
+    # show IoU
+    print(f"ML: IoU={ml.iou}")
+    print(f"PCA: IoU={pca.iou}")
