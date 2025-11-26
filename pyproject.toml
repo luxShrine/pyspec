@@ -4,11 +4,8 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "pyspectral"
-version = "0.0.1"
+version = "0.1.0"
 description = "Machine learning for processing spectral imaging"
-authors = [
-  { name = "" },
-]
 license = { file = "LICENSE" }
 readme = "README.md"
 classifiers = [
@@ -17,6 +14,7 @@ classifiers = [
 ]
 dependencies = [
     "beartype>=0.22.5",
+    "ipympl>=0.9.8",
     "jaxtyping>=0.3.3",
     "loguru",
     "matplotlib>=3.10.6",
@@ -44,6 +42,10 @@ dev = [
 [project.scripts]
 pyspec = "pyspectral.cli:main"
 
+# ============================================================
+# RUFF CONFIGURATION 
+# ============================================================
+
 [tool.ruff]
 line-length = 88
 src = ["pyspectral"]
@@ -55,9 +57,18 @@ ignore = ["F722"]  # for fixing JAXtyping
 
 [tool.ruff.lint.isort]
 known-first-party = ["pyspectral"]
+combine-as-imports = true
 force-sort-within-sections = true
 
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+# ============================================================
 # type linting settings
+# ============================================================
 [tool.mypy]
 warn_unused_configs = true
 warn_redundant_casts = true
@@ -79,32 +90,101 @@ warn_unreachable = true
 
 [tool.basedpyright]
 include = ["pyspectal"]
-exclude = ["**/__pycache__"]
+stubPath = "stubs/"
 defineConstant = { DEBUG = true }
 pythonVersion = "3.13"
-disableOrganizeImports = true
-diagnosticMode = "openFilesOnly"
-autoSearchPaths = true
 pythonPlatform = "Windows"
+reportAny = false
 autoImportCompletions = true
 useLibraryCodeForTypes = true
-reportAny = false
 reportMissingTypeArgument = false
 reportMissingTypeStubs = false
 reportUnknownArgumentType = false
 reportExplicitAny = false
 reportUnknownMemberType = false
+reportIgnoreCommentWithoutRule = false
 reportUnknownParameterType = false
 reportUntypedFunctionDecorator = false
-reportConstantRedefinition = false
+reportConstantRedefinition = true
 reportUnknownVariableType = false
 reportUnusedCallResult = false
 reportUnusedImport = "none"
 reportMissingImports = "error"
 reportUnusedVariable = "hint" 
+# Null safety
+reportOptionalSubscript = true
+reportOptionalMemberAccess = true
+reportOptionalCall = true
+reportOptionalIterable = true
+reportOptionalContextManager = true
+reportOptionalOperand = true
 
-[tool.basedpyright.inlayHints]
-variableTypes = true
-callArgumentNames = true
-functionReturnTypes = true
-genericTypes = true 
+# ============================================================
+# EXCLUSIONS
+# ============================================================
+exclude = [
+    "**/__pycache__",
+    "**/node_modules",
+    ".git",
+    ".mypy_cache",
+    ".pyright_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    ".venv",
+    "venv",
+    "env",
+    "logs",
+    "output",
+    "data",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+venvPath = "."
+venv = ".venv"
+
+# ============================================================
+# PYTEST CONFIGURATION
+# ============================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+# ============================================================
+# COVERAGE CONFIGURATION
+# ============================================================
+[tool.coverage.run]
+source = ["."]
+branch = true  # STRICT: Enable branch coverage
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__pycache__/*",
+    "*/.venv/*",
+    "*/venv/*",
+    "*/scripts/*",
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+fail_under = 30  # Require 30% coverage
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "@overload",
+]
