@@ -1,54 +1,36 @@
 # pyspectral
 
-Machine learning for processing spectral imaging
+Machine learning for processing spectral imaging.
 
-## Project Organization
+## Getting started
+- Python 3.13 with `uv` is expected. Create the env with `make create_environment`,
+  activate it, then install dependencies via `make requirements`.
+- Run checks with `make format`, `make lint`, `make type`, and `make test`
+  (use `pytest -m "not slow"` to skip slow tests).
+- Convert raw HSI `.txt` files to structured `.npz`/`.json` assets in `data/ready`
+  with the interactive CLI: `uv run pyspec`. The command looks for a metadata
+  CSV in `data/` (columns like `raw_path` and `presence`) and writes outputs next
+  to the raw files.
 
+## Project layout
 ```
-├── LICENSE            <- Open-source license
-├── Makefile           <- Makefile with convenience commands like `make data` or `make train`
-├── README.md          <- The top-level README for developers using this project.
-├── data
-│   ├── external       <- Data from third party sources.
-│   ├── interim        <- Intermediate data that has been transformed.
-│   ├── processed      <- The final, canonical data sets for modeling.
-│   └── raw            <- The original, immutable data dump.
-│
-├── docs               <- mkdocs project
-│
-├── models             <- Trained and serialized models, model predictions, or model summaries
-│
-├── notebooks          <- Jupyter notebooks. Naming convention is a number (for ordering),
-│                         the creator's initials, and a short `-` delimited description, e.g.
-│                         `1.0-jqp-initial-data-exploration`.
-│
-├── pyproject.toml     <- Project configuration file with package metadata for
-│                         pyspectral and configuration for tools like black
-│
-├── references         <- Data dictionaries, manuals, and all other explanatory materials.
-│
-├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
-│   └── figures        <- Generated graphics and figures to be used in reporting
-│
-├── uv.lock            <- The requirements file for reproducing the analysis environment, e.g.
-│                         generated with `uv lock`
-│
-└── pyspectral         <- Source code for use in this project.
-    │
-    ├── __init__.py             <- Makes pyspectral a Python module
-    │
-    ├── config.py               <- Store useful variables and configuration
-    │
-    ├── dataset.py              <- Scripts to download or generate data
-    │
-    ├── features.py             <- Code to create features for modeling
-    │
-    ├── modeling
-    │   ├── __init__.py
-    │   ├── predict.py          <- Code to run model inference with trained models
-    │   └── train.py            <- Code to train models
-    │
-    └── plots.py                <- Code to create visualizations
+Makefile           # Helper commands for env setup, linting, typing, testing
+pyproject.toml     # Project metadata and tool configuration (ruff, mypy, pytest)
+data/              # Project data (raw/interim/processed/external/ready, keep large files out of git)
+docs/              # MkDocs site (docs/mkdocs.yml + docs/docs/*)
+models/            # Trained weights and exported artifacts
+notebooks/         # Experiment notebooks (n.n-initials-title.ipynb)
+reports/           # Generated reports and figures
+references/        # Background material and papers
+stubs/             # Type stub overrides
+tests/             # Pytest suite
+pyspectral/        # Library code
+  config.py        # Paths, logging, RNG seed, and shared constants
+  core.py          # Spectral cube/flat helpers, z-scoring, and typed containers
+  cli.py           # Interactive entrypoint (`uv run pyspec`) for raw-to-ready conversion
+  types.py         # Numpy typing aliases
+  data/            # Data ingestion, preprocessing, simulation, and I/O helpers
+  modeling/        # Models, training loops, and out-of-fold utilities
+  result/          # Inference, comparison, and plotting helpers
+uv.lock            # Locked dependencies synced via `make requirements`
 ```
-
----
