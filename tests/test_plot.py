@@ -2,7 +2,7 @@ import numpy as np
 
 from pyspectral.config import RNG
 import pyspectral.core as pc
-import pyspectral.plots as plot
+import pyspectral.result.plots as plot
 
 
 def test_plot_boundary():

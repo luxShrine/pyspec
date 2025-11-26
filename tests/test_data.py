@@ -10,8 +10,17 @@ prc_paths = PROCESSED_DATA_DIR.glob("*.txt")
 prc_first = next(prc_paths)
 csv_path = next(DATA_DIR.glob("*.csv"))
 
-hsi_raw = pdi.HSIMap.from_txt(raw_first, acq_time_s=10.0, accumulation=2, presence=True)
-hsi_prc = pdi.HSIMap.from_txt(prc_first, acq_time_s=10.0, accumulation=2, presence=True)
+raw_p = pdi.Presence.create_map(8, 8, 1)
+prc_p = pdi.Presence.create_map(8, 8, 1)
+raw_p = pdi.Presence(np.float64(1), raw_p)
+prc_p = pdi.Presence(np.float64(1), prc_p)
+
+hsi_raw = pdi.HSIMap.from_txt(
+    raw_first, acq_time_s=10.0, accumulation=2, presence=raw_p
+)
+hsi_prc = pdi.HSIMap.from_txt(
+    prc_first, acq_time_s=10.0, accumulation=2, presence=prc_p
+)
 
 wl, xy, spectra, cube = (hsi_raw.wl, hsi_raw.xy, hsi_raw.spectra, hsi_raw.cube)
 wl_gt, xy_gt, spectra_gt, cube_gt = (
@@ -38,7 +47,7 @@ def test_loading_hsi_map():
 def test_spectral_pair():
     from sklearn.model_selection import KFold
 
-    import pyspectral.modeling.predict as predict
+    import pyspectral.result.predict as predict
 
     pair = pdi.SpectraPair(
         spectra.get().astype(np.float64), spectra_gt.get().astype(np.float64)
@@ -51,11 +60,11 @@ def test_spectral_pair():
 
 
 def test_oof_stats():
-    from pyspectral.modeling.train import OOFStats
+    from pyspectral.modeling.oof import Stats
 
     rows = pdi.read_pairs(csv_path, DATA_DIR)
     pair, arts = pdi.SpectraPair.from_annotations(rows)
     _raw = pair.X_raw.astype(np.float32)  # (N,C)
     prc = pair.Y_proc.astype(np.float32)  # (N,C)
-    oof_stats = OOFStats(prc, arts)
-    assert isinstance(oof_stats, OOFStats)
+    oof_stats = Stats(prc, arts)
+    assert isinstance(oof_stats, Stats)
