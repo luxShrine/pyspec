@@ -146,6 +146,51 @@ class FoldStat:
         )
 
 
+# -- pixel to class -------------------------------------------------------
+
+
+def convert_to_class(pres: float, *, maybe_value: float | None = 0.5):
+    """converts presence from ∈ {0,2} to ∈ {0,1}.
+
+    Args:
+        maybe_value: float or None, if None, we drop the value.
+    """
+    if pres == 0:
+        return UnitFloat(0.0)
+    elif pres == 2:
+        return UnitFloat(1.0)
+    else:
+        if maybe_value is None:
+            return maybe_value
+        return UnitFloat(maybe_value)
+
+
+def convert_arr_to_class(
+    arr: np.ndarray[tuple[int]],
+    *,
+    dtype: None | npt.DTypeLike = None,
+    maybe_value: float | None = 0.5,
+) -> np.ndarray[tuple[int]]:
+    return np.asarray(
+        [convert_arr_to_class(i, maybe_value=maybe_value) for i in arr], dtype=dtype
+    )
+
+
+def make_pca_features(X_train: np.ndarray, X_test: np.ndarray, n_components: int = 10):
+    # standardize per-band
+    scaler = StandardScaler(with_mean=True, with_std=True)
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
+
+    pca = PCA(n_components=n_components, svd_solver="full")
+    Z_train = pca.fit_transform(X_train_sc)
+    Z_test = pca.transform(X_test_sc)
+    return Z_train.astype("float32"), Z_test.astype("float32"), pca, scaler
+
+
+# -- per pixel details -------------------------------------------------------
+
+
 # TODO:
 def get_concentration(absorption: ArrayF, k: ArrayF):
     # Regression, we can use least squares to measure concentration:
@@ -228,21 +273,6 @@ class RegionSet:
         elif self.hi_window[0] <= sample and sample <= self.hi_window[1]:
             return "high"
         return None
-
-
-def _filter_array(
-    array: ArrayF, wl: ArrayF, lower_bound: float, upper_bound: float
-) -> tuple[ArrayF, ArrayF]:
-    mask = (wl >= lower_bound) & (wl <= upper_bound)
-    if not np.any(mask):
-        return np.empty(0, dtype=array.dtype), np.empty(0, dtype=array.dtype)
-    return array[..., mask], wl[mask]
-
-
-def _area_under_curve(y: ArrayF, x: ArrayF) -> float:
-    if y.size < 2:
-        return np.nan
-    return float(np.trapezoid(y, x))
 
 
 def _log_ratio_area(
@@ -355,9 +385,12 @@ def _disjoint_baseline_window(
     return lo, hi
 
 
+# -- helper to build spectral band features ------------------------------------------------------
+
+
 def create_specband_feats(
-    spectra: ArrayF,
-    wl: ArrayF,
+    spectra: Arr1DF,
+    wl: Arr1DF,
     regions: RegionSet,
     baseline_point: float = REF_PHE,
 ) -> SpectraBandFeatures:
