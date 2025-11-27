@@ -517,9 +517,7 @@ def do_MLSVM_plots(data: MLSVMPlot) -> None:
 
     # PCA plots
     pca = data.pca_cmp
-    plot_pixel_histogram(
-        pca.pred.pos, pca.pred.neg, pca.pred.maybe, bins=3, log_scale=True
-    )
+    plot_pixel_histogram(pca.pred.pos, pca.pred.neg, pca.pred.maybe, bins=25)
 
     # keep positive & negative
     svc = data.svc_preds[0]
