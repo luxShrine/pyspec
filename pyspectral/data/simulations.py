@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import TypedDict
 
 import numpy as np
 from scipy.signal import savgol_filter
 
-from pyspectral.core import Cube
+from pyspectral.core import Cube, FlatMap
+from pyspectral.data.preprocessing import ALS, poly_baseline_subtract
 from pyspectral.types import Arr1DF, Arr2DF, ThirdCoeff
 
 
@@ -46,10 +49,13 @@ class PeakDef:
     width: float  # sigma_k
 
     @classmethod
-    def from_distribution(cls, nu: Arr1DF, intensity: Arr1DF, peak_point: float):
+    def from_distribution(
+        cls, nu: Arr1DF, intensity: Arr1DF, peak_point: float
+    ) -> PeakDef:
         idx_peak = find_nearest(nu, peak_point)
-        width = get_fwhm(nu, intensity, idx_peak)
-        return cls(center=peak_point, width=width)
+        fwhm = get_fwhm(nu, intensity, idx_peak)
+        sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        return cls(center=peak_point, width=sigma)
 
     def gauss(self, nu: Arr1DF) -> Arr1DF:
         return np.exp(-0.5 * ((nu - self.center) / self.width) ** 2)
@@ -73,7 +79,7 @@ class PolyCoeffStats:
         return np.random.multivariate_normal(self.mean, self.cov)
 
     @classmethod
-    def fit(cls, nus: list[Arr1DF], bases: list[Arr1DF]):
+    def fit(cls, nus: list[Arr1DF], bases: list[Arr1DF]) -> PolyCoeffStats:
         """
         Fit a 2nd-order polynomial to each (nu, baseline) pair and
         return multivariate Gaussian stats for [p0, p1, p2].
@@ -104,7 +110,7 @@ class NoiseStats:
         return np.random.normal(self.mean, self.std, size=shape)
 
     @classmethod
-    def from_intensities(cls, intensities: list[Arr1DF]):
+    def from_intensities(cls, intensities: list[Arr1DF]) -> NoiseStats:
         """
         Estimate noise mean and std across a list of 1D spectra.
         """
@@ -170,7 +176,7 @@ class ClassSimStats:
         nu: Arr1DF,
         class_spectra: list[Arr1DF],
         peak_points: tuple[float, ...],
-    ):
+    ) -> ClassSimStats:
         arr = np.asarray(class_spectra)  # (N_class, C)
         avg = arr.mean(axis=0)  # (C,)
 
@@ -194,7 +200,7 @@ class ClassSimStats:
 def simulate_Arr1DF_single(
     nu: Arr1DF,
     cls_stats: ClassSimStats,
-    poly_stats: PolyCoeffStats,
+    base: PolyCoeffStats | list[Arr1DF],
     noise_stats: NoiseStats,
 ) -> Arr1DF:
     I_clean = np.zeros_like(nu)
@@ -204,8 +210,13 @@ def simulate_Arr1DF_single(
         I_clean += A_k * peak_def.gauss(nu)
 
     # Baseline
-    p0, p1, p2 = poly_stats.sample()
-    baseline = p0 + p1 * nu + p2 * (nu**2)
+    if isinstance(base, PolyCoeffStats):
+        p0, p1, p2 = base.sample()
+        baseline = p0 + p1 * nu + p2 * (nu**2)
+    else:
+        # flat_base_pixels: list[Arr1DF], shape (N_pixels, C)
+        idx = np.random.randint(len(base))
+        baseline = base[idx].copy()
     I_clean += baseline
 
     # Noise
@@ -217,7 +228,7 @@ def simulate_map_from_labels(
     labels: np.ndarray[tuple[int, int]],  # (H, W), 0/1/2
     nu: Arr1DF,  # (C,)
     stats_by_class: dict[str, ClassSimStats],
-    poly_stats: PolyCoeffStats,
+    base: PolyCoeffStats | list[Arr1DF],
     noise_stats: NoiseStats,
 ) -> np.ndarray[tuple[int, int, int], np.dtype[np.float32]]:
     H, W = labels.shape
@@ -230,9 +241,7 @@ def simulate_map_from_labels(
         for j in range(W):
             cls_name = id_to_name[int(labels[i, j])]
             cls_stats = stats_by_class[cls_name]
-            sim_cube[i, j, :] = simulate_Arr1DF_single(
-                nu, cls_stats, poly_stats, noise_stats
-            )
+            sim_cube[i, j, :] = simulate_Arr1DF_single(nu, cls_stats, base, noise_stats)
 
     return sim_cube
 
@@ -242,6 +251,7 @@ def simulate_from_single_hsi(
     nu: Arr1DF,  # (C,)
     labels: np.ndarray,  # (H, W) with 0/1/2
     peak_points: tuple[float, ...],  # e.g. (1003.0, 1410.0, 1600.0)
+    do_polyfit: bool = False,
 ) -> Cube:
     # Split spectra by class
     spectra_by_class = cube.split_cube_by_label(labels)
@@ -256,19 +266,79 @@ def simulate_from_single_hsi(
 
     # Fit global baseline & noise
     flat = cube.flatten()
-    pixel_spec = flat.get_pixels()
     nus = [nu] * flat.N
-    # WARN: without explicit baselines, treating full spectra as “baseline + peaks”
-    # TODO: use baseline estimate from pre-processing here instead
-    poly_stats = PolyCoeffStats.fit(nus, bases=pixel_spec)
-    noise_stats = NoiseStats.from_intensities(pixel_spec)
+    # WARN: without explicit baselines, must treat full spectra as “baseline + peaks”
+    # or currently using baseline estimate from pre-processing here instead
+
+    baseline, base_sub = poly_baseline_subtract(flat.get(), nu, 6)
+
+    flat_base = FlatMap.make(baseline)
+    flat_base_pixels = flat_base.get_pixels()
+    flat_base_sub = FlatMap.make(base_sub)
+    flat_basesub_pixels = flat_base_sub.get_pixels()
+
+    if do_polyfit:
+        base = PolyCoeffStats.fit(nus, bases=flat_basesub_pixels)
+    else:
+        base = flat_base_pixels
+
+    noise_stats = NoiseStats.from_intensities(flat_basesub_pixels)
 
     # Simulate new cube with same label layout
     sim_cube = simulate_map_from_labels(
         labels=labels,
         nu=nu,
         stats_by_class=stats_by_class,
-        poly_stats=poly_stats,
+        base=base,
         noise_stats=noise_stats,
     )
     return Cube.make(sim_cube)
+
+
+# -- New method of sampling
+
+
+@dataclass
+class BandwiseClassStats:
+    mu: Arr1DF  # (C,)
+    sigma: Arr1DF  # (C,)
+
+    @classmethod
+    def fit(cls, class_spectra: list[Arr1DF]) -> BandwiseClassStats:
+        arr = np.asarray(class_spectra, dtype=np.float64)  # (N, C)
+        mu = arr.mean(axis=0)
+        sigma = arr.std(axis=0, ddof=1)
+        return cls(mu=mu, sigma=sigma)
+
+    def sample(self) -> Arr1DF:
+        eps = np.random.normal(0.0, 1.0, size=self.mu.shape)
+        return self.mu + self.sigma * eps
+
+
+def simulate_from_single_hsi_bandwise(
+    cube: Cube,
+    nu: Arr1DF,
+    labels: np.ndarray,  # (H, W)
+) -> Cube:
+    spectra_by_class = cube.split_cube_by_label(labels)
+
+    stats_by_class: dict[str, BandwiseClassStats] = {}
+    specs: list[Arr1DF]
+    for cls_name, specs in spectra_by_class.items():  # pyright: ignore[reportAssignmentType]
+        if len(specs) == 0:
+            raise RuntimeError(f"No pixels for class {cls_name}")
+        stats_by_class[cls_name] = BandwiseClassStats.fit(specs)
+
+    H, W = labels.shape
+    C = nu.shape[0]
+    sim = np.zeros((H, W, C), dtype=np.float32)
+
+    id_to_name = {0: "negatives", 1: "maybe", 2: "samples"}
+
+    for i in range(H):
+        for j in range(W):
+            cls_name = id_to_name[int(labels[i, j])]
+            cls_stats = stats_by_class[cls_name]
+            sim[i, j, :] = cls_stats.sample()
+
+    return Cube.make(sim)
