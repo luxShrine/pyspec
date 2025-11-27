@@ -1,10 +1,12 @@
 import numpy as np
+import pytest
 
 from pyspectral.config import RNG
 import pyspectral.core as pc
 import pyspectral.result.plots as plot
 
 
+@pytest.mark.slow
 def test_plot_boundary():
     NUM_CENTER: float = 1654.0  # example Raman peak
     DEN_CENTER: float = 1446.0

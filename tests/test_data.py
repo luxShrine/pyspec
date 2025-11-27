@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyspectral.config import DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
 import pyspectral.data.io as pdi
@@ -59,6 +60,7 @@ def test_spectral_pair():
     assert isinstance(pred, np.ndarray)
 
 
+@pytest.mark.slow
 def test_oof_stats():
     from pyspectral.modeling.oof import Stats
 

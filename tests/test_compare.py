@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from sklearn.metrics import confusion_matrix
 
 from pyspectral.result.compare import _get_positive_negative_mask
