@@ -39,24 +39,27 @@ def _median_spike_removal(y: FlatMap, k: int | None) -> Arr2DF:
     return out
 
 
-def _poly_baseline_subtract(y: ArrayF, wl: ArrayF, degree: int | None) -> ArrayF:
+def poly_baseline_subtract(
+    y: ArrayF, wl: ArrayF, degree: int | None
+) -> tuple[ArrayF, ArrayF]:
     """Fit polynomial baseline per spectrum; subtract it."""
+    out = np.empty_like(y)
+    baseline = np.empty_like(y)
     if degree is None:
         logger.debug("No baseline subtraction done.")
-        return y
+        return baseline, y
     x = wl.astype(np.float64)
-    out = np.empty_like(y)
     V = np.vander(x, N=degree + 1, increasing=False)  # (M, deg+1)
     # Precompute pseudo-inverse
-    V_pinv = np.linalg.pinv(
-        V
-    )  # or use np.linalg.lstsq(V, y[i], rcond=None)[0] in the loop
+    V_pinv = np.linalg.pinv(V)
+    # TODO: try to use np.linalg.lstsq(V, y[i], rcond=None)[0] in the loop
     for i in range(y.shape[0]):
         # least squares solution of: x = (y_i - [(V^-1 * y_i) * V])
         coeff = V_pinv @ y[i].astype(np.float64)
-        baseline = V @ coeff
-        out[i] = (y[i] - baseline).astype(np.float32)
-    return out
+        base = V @ coeff
+        baseline[i] = base
+        out[i] = y[i] - base
+    return baseline, out
 
 
 def normalize_to_peak(
@@ -75,7 +78,7 @@ def normalize_to_peak(
             + f"given wl range [{wl.min()}, {wl.max()}]. Check units and peak center."
         )
     denom = y[:, mask].max(axis=1, keepdims=True) + 1e-8
-    return y / denom
+    return np.asarray(y / denom, dtype=np.float64)
 
 
 def _refine_peak_center(wl: ArrayF, y: ArrayF, i: int) -> float:
@@ -137,7 +140,8 @@ class SmoothCfg:
             )
 
     def smooth(self, y: np.ndarray) -> ArrayF:
-        return savgol_filter(y, window_length=self.window, polyorder=self.poly, axis=1)
+        sm = savgol_filter(y, window_length=self.window, polyorder=self.poly, axis=1)
+        return sm.astype(np.float64)
 
 
 @dataclass
@@ -161,24 +165,24 @@ class ALS:
 
     def _solve_for_z(
         self,
-        dt_d: sparse.csc_array,
+        dt_d: sparse.csc_matrix,
         wi: Arr1DF,
         yi: np.ndarray[tuple[int, ...], np.dtype[np.float64]],
         C: int,
-    ) -> sparse.csc_array:
+    ) -> Arr1DF:
         """Construct A = W + λ D^T D, and solve for z in Az = Wy."""
         lam = self.smoothness
 
-        W: sparse.dia_matrix = sparse.diags(wi, 0, shape=(C, C), format="csc")
-        A: sparse.dia_matrix = W + (lam * dt_d)
+        W: sparse.csc_matrix = sparse.diags(wi, 0, shape=(C, C), format="csc")
+        A: sparse.csc_matrix = W + (lam * dt_d)
         b = wi * yi  # W y
-        zi: sparse.csc_array = spsolve(A, b)
+        zi: Arr1DF = spsolve(A, b)
         return zi
 
     def remove_baseline(
         self,
         y: Arr1DF | Arr2DF,
-    ) -> tuple[np.ndarray, ArrayF32]:
+    ) -> tuple[np.ndarray, ArrayF]:
         """
         Robust baseline via asymmetric least squares (ALS).
 
@@ -217,13 +221,13 @@ class ALS:
         # Build second-difference operator (D^2), a second derivative to act on z
         # d_op acts as a penalty to non-smooth curves, these high slope regions
         # are likely to be peaks, not a part of the baseline
-        d_op: sparse.dia_matrix = sparse.diags(
+        d_op: sparse.csc_matrix = sparse.diags(
             [1, -2, 1],
-            [0, 1, 2],  # pyright: ignore[reportArgumentType]
+            [0, 1, 2],
             shape=(C - 2, C),
             format="csc",
         )
-        dt_d: sparse.csc_array = (d_op.T @ d_op).tocsc()
+        dt_d: sparse.csc_matrix = (d_op.T @ d_op).tocsc()
 
         # Construct peak mask (shared across rows)
         threshold = np.nanpercentile(Y, MASK_PERCENTILE, axis=-1, keepdims=True)
@@ -279,7 +283,7 @@ class ALS:
         baseline = Z.reshape(orig_shape)
         baseline = np.moveaxis(baseline, -1, axis)
         corrected = np.moveaxis(y.reshape(orig_shape), -1, axis) - baseline
-        return baseline, corrected.astype(np.float32)
+        return baseline, corrected.astype(np.float64)
 
 
 @dataclass
@@ -421,7 +425,7 @@ type NormResult = tuple[
 class PeakNormConfig:
     mode: PeakNormMode
     # used in all modes where a center exists
-    halfwidth_cm1: float = 12.0
+    halfwidth_cm1: float = 16.0
 
     def fit_preproc(
         self,
@@ -477,7 +481,7 @@ class CubeStats:
 
 def preprocess_cube(
     cube_maybe: Cube | CubeStats,
-    wl_cm1: ArrayF,  # (M,)
+    wl_cm1: ArrayF,  # (C,)
     pre_config: PreConfig | None = None,
     peak_cfg: PeakNormConfig | None = None,
 ) -> tuple[Cube, PreprocStats]:
@@ -505,7 +509,7 @@ def preprocess_cube(
     # find & remove baseline
     baseline_method = pre_config.baseline
     if isinstance((degree := baseline_method), int):
-        y = _poly_baseline_subtract(y, wl_cm1, degree=degree)
+        _, y = poly_baseline_subtract(y, wl_cm1, degree=degree)
     elif isinstance(baseline_method, ALS):
         _baseline, y = baseline_method.remove_baseline(y)
 
@@ -535,7 +539,7 @@ class SameGridCubes:
 
     def pre_process(
         self, pre_config: PreConfig, peak_cfg: PeakNormConfig | None = None
-    ):
+    ) -> tuple[Cube, Cube, PreprocStats]:
         cube_x, train_stats = preprocess_cube(
             cube_maybe=self.xcube,
             wl_cm1=self.common_wl,
