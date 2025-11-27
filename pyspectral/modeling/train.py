@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
+from pathlib import Path
 
 from loguru import logger
 import numpy as np
@@ -9,6 +11,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from pyspectral.config import MODELS_DIR
 from pyspectral.core import TestResult
 from pyspectral.data.dataset import (
     build_pix_scene_datasets,
@@ -230,28 +233,40 @@ def run_epochs(
     test_dl: DataLoader,
     train_setup: pm.TrainSetup,
     device: torch.device,
-) -> tuple[oof.FoldLoss, list[ArrayF32] | None]:
+    return_best_state: bool = False,
+) -> tuple[oof.FoldLoss, list[ArrayF32] | None, dict | None]:
     # metrics
     best_vl_loss, best_preds, fi, tr_loss, vl_loss = float("inf"), None, 0.0, [], []
     model = train_setup.model
     loss_fn = train_setup.loss_fn
-    optimizer = train_setup.optimizer
-    penalty = train_setup.penalty
+    best_state: dict | None = None
 
     for _ep in tqdm(range(1, epochs + 1), desc="Running Epochs..."):
         tr_loss.append(
-            train_epoch(train_dl, model, loss_fn, optimizer, device, penalty)
+            train_epoch(
+                train_dl,
+                model,
+                loss_fn,
+                train_setup.optimizer,
+                device,
+                train_setup.penalty,
+            )
         )
+
         test_result = test_epoch(test_dl, model, loss_fn, device)
         fi = test_result.fraction_improved
-
         vl_loss.append(test_result.test_loss)
+
         if test_result.test_loss < best_vl_loss:
             best_vl_loss = test_result.test_loss
             best_preds = test_result.predictions
+            # capture weights
+            best_state = copy.deepcopy(model.state_dict())
 
     fold_loss = oof.FoldLoss(np.asarray(tr_loss), np.asarray(vl_loss), fi, best_vl_loss)
-    return fold_loss, best_preds
+    if return_best_state:
+        return fold_loss, best_preds, best_state
+    return fold_loss, best_preds, None
 
 
 def cv_train_model(
@@ -310,7 +325,7 @@ def cv_train_model(
 
         train_setup.log_init(fold)
 
-        fold_loss, best_preds = run_epochs(
+        fold_loss, best_preds, _ = run_epochs(
             epochs,
             train_dl,
             test_dl,
@@ -382,7 +397,7 @@ def train_class(
 
         train_setup.log_init(fold)
 
-        fold_loss, best_preds = run_epochs(
+        fold_loss, best_preds, _ = run_epochs(
             epochs,
             train_dl,
             test_dl,
@@ -419,6 +434,8 @@ def train_pixel(
     device = pick_device() if not cpu_override else torch.device("cpu")
     # TODO: calculate this for pixels (always 1x1)
     h = w = 1
+    # TODO: make this an argument
+    save_dir: Path | None = MODELS_DIR
 
     region_set = RegionSet()
     oof_stats = oof.PxlStats(class_pair.arts)
@@ -444,13 +461,15 @@ def train_pixel(
         )
         train_setup.log_init(fold)
 
-        fold_loss, best_preds = run_epochs(
-            epochs,
-            train_dl,
-            test_dl,
-            train_setup,
-            device,
+        fold_loss, best_preds, best_state = run_epochs(
+            epochs, train_dl, test_dl, train_setup, device, return_best_state=True
         )
+        if best_state is not None:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                best_state,
+                save_dir / f"pixel_model_fold{fold}.pt",
+            )
 
         if verbose:
             out = f"Fold {fold + 1} |" + fold_loss.repr()

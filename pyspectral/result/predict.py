@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,14 +32,16 @@ class MaskedValues:
     maybe: np.ndarray
     neg: np.ndarray
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[np.ndarray]:
         yield from (self.pos, self.maybe, self.neg)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> np.ndarray:
         col = [self.pos, self.maybe, self.neg]
         return col[idx]
 
-    def __array__(self, dtype: np.dtype | None = None, copy: bool | None = None):
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         arr = np.concat([self.pos, self.maybe, self.neg], dtype=dtype)
         return arr
 
@@ -63,7 +66,7 @@ class MaskedValues:
         )
 
     @staticmethod
-    def get_mask(true_arr: np.ndarray):
+    def get_mask(true_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         mask_pos = true_arr == 2.0
         mask_neg = true_arr == 0.0
         mask_maybe = true_arr == 1.0
@@ -76,11 +79,11 @@ class MaskedValues:
         mask_pos: np.ndarray,
         mask_neg: np.ndarray,
         mask_maybe: np.ndarray,
-    ):
+    ) -> MaskedValues:
         return cls(arr[mask_pos], arr[mask_maybe], arr[mask_neg])
 
     @classmethod
-    def build(cls, arr: np.ndarray, true_arr: np.ndarray):
+    def build(cls, arr: np.ndarray, true_arr: np.ndarray) -> MaskedValues:
         mask_pos, mask_maybe, mask_neg = cls.get_mask(true_arr)
         return cls(arr[mask_pos], arr[mask_maybe], arr[mask_neg])
 

@@ -2,7 +2,7 @@ from pyspectral.config import DATA_DIR
 import pyspectral.data.io as pi
 
 
-def do_conversion():
+def do_conversion() -> None:
     csv = None
     for f in DATA_DIR.glob("*.csv"):
         user_input = input(f"Use '{f}' as metadata container? (y/n) ")
@@ -22,7 +22,7 @@ def do_conversion():
     pi.convert_raw_class(csv=csv, base=DATA_DIR)
 
 
-def main():
+def main() -> None:
     while True:
         user_input = input("Convert raw HSI txt files to formatted files? (y/n) ")
         user_input = user_input.lower()

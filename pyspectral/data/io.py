@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from dataclasses import dataclass, is_dataclass, replace
 import json
 from pathlib import Path
@@ -27,12 +28,14 @@ from pyspectral.types import (
 
 # -- data helpers
 
+type AnyDict = dict[str, Any]
+
 
 def extract_arrays[T](
     obj: T, prefix: str = ""
-) -> tuple[dict[str, Any] | T | list[Any], dict[str, Any]]:
-    arrays: dict[str, Any] = {}
-    meta = obj
+) -> tuple[AnyDict | T | list[Any], AnyDict]:
+    arrays: AnyDict = {}
+    meta: AnyDict | T | list[Any] = obj
 
     if is_dataclass(obj):
         meta = {}
@@ -78,7 +81,7 @@ def save_outer(obj: Any, path: Path) -> None:
         json.dump(meta, f, indent=2)
 
 
-def restore_arrays(meta: Any, arrays: dict[str, Any]) -> list[Any] | dict[str, Any]:
+def restore_arrays(meta: Any, arrays: AnyDict) -> list[Any] | AnyDict:
     if isinstance(meta, dict) and "__array__" in meta:
         key = meta["__array__"]
         return arrays[key]
@@ -99,11 +102,13 @@ class SafeData:
     base_dir: Path
     data_file: Path
 
-    def __iter__(self):
+    def __iter__(self) -> Generator[AnyDict, Any, None]:
         yield from self.df.iter_rows(named=True)
 
     @classmethod
-    def create(cls, base_dir: Path | str, csv_file: Path | str, optional_col: set[str]):
+    def create(
+        cls, base_dir: Path | str, csv_file: Path | str, optional_col: set[str]
+    ) -> SafeData:
         base = Path(base_dir) if isinstance(base_dir, str) else base_dir
         csv = Path(csv_file) if isinstance(csv_file, str) else csv_file
         if not base.is_dir():
@@ -203,7 +208,7 @@ class DataArtifacts:
         return self.slices[scene_idx]
 
     def scene_of(self, global_idx: int) -> ArrayI:
-        x = self.pixel_to_scene[global_idx]
+        x: ArrayI = self.pixel_to_scene[global_idx]
         return x
 
     def reshape_scene(self, arr_flat: ArrayF, scene_idx: int) -> ArrayF:
@@ -382,11 +387,13 @@ class HSIMap:
             return cls.from_dict(restored)
         return None
 
-    def get_artifacts(self):
+    def get_artifacts(self) -> tuple[Presence, ArrayF, tuple[int, int]]:
         return (self.presence, self.wl, (self.cube.H, self.cube.W))
 
 
-def read_class(csv_file: Path, base_dir: Path):
+def read_class(
+    csv_file: Path, base_dir: Path
+) -> Generator[tuple[HSIMap, AnyDict], Any, None]:
     """Read annotations file to retrieve HSIMaps for purpose of classification."""
 
     # NOTE: currently discard proc_path
@@ -580,7 +587,8 @@ def build_classification(
         # search for .npz, each should correspond to a json
         paths = base.glob("*.npz")
         data = map(lambda x: HSIMap.from_processed(x), paths)
-        data = (y for y in data if y is not None)
+
+    data = (y for y in data if y is not None)
 
     pre_arts: PreArts = {
         "hw": [],

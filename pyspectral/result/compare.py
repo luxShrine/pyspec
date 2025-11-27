@@ -54,7 +54,9 @@ from pyspectral.types import (
 # -- General Compare -------------------------------------------------------
 
 
-def confusion_at_threshold(true: np.ndarray, pred: np.ndarray, threshold: float = 0.5):
+def confusion_at_threshold(
+    true: np.ndarray, pred: np.ndarray, threshold: float = 0.5
+) -> dict[str, int]:
     y_hat = (pred >= threshold).astype(np.float32)
 
     tp = np.sum((true == 1.0) & (y_hat == 1.0))
@@ -73,7 +75,7 @@ class ClassicalPredict:
 
 
 class FoldPlot:
-    def __init__(self, oof_stats: oof.Stats, label: str):
+    def __init__(self, oof_stats: oof.Stats, label: str) -> None:
         all_loss = oof_stats.get_loss()
         self.train_loss: ArrayF = all_loss.loss.train
         self.test_loss: ArrayF = all_loss.loss.test
@@ -185,7 +187,7 @@ class MLSVMPlot:
     pca_cmp: PredCompare
     svc_preds: list[SVCPred]
 
-    def get_cm(self):
+    def get_cm(self) -> tuple[ConfusionMatrixDisplay, ConfusionMatrixDisplay]:
         disp_ml = ConfusionMatrixDisplay(self.ml_cmp.cm)
         disp_cm = ConfusionMatrixDisplay(self.pca_cmp.cm)
         return disp_ml, disp_cm
@@ -260,7 +262,9 @@ def _do_ml_predict(
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
-):
+) -> tuple[
+    PredCompare, oof.EpochLosses, np.ndarray[tuple[int], np.dtype[np.float32]]
+]:
     oof_stats = train_pixel(
         class_pair,
         n_splits=N_SPLITS,
@@ -293,7 +297,7 @@ def _do_pca_svm_predict(
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
-):
+) -> tuple[PredCompare, list[SVCPred]]:
     presence_maps = np.concatenate([x.map.flatten() for x in arts.presences])
     y_binary = (presence_maps == 2.0).astype(np.int32, copy=False)
 
@@ -318,7 +322,8 @@ def _do_pca_svm_predict(
         ]
     )
 
-    svc_prob: np.ndarray[tuple[int, int]] = cross_val_predict(  # pyright: ignore[reportAssignmentType]
+    # pyright: ignore[reportAssignmentType]
+    svc_prob: np.ndarray[tuple[int, int]] = cross_val_predict(
         pipeline, X=X_pix, y=y_binary, cv=cv_indices, method="predict_proba"
     )
     svc_pos_probs = np.asarray(svc_prob[:, 1], dtype=np.float32)
@@ -354,7 +359,7 @@ def _do_pca_svm_predict(
     return pca_cmp, [svc_pred]
 
 
-def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10):
+def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> MLSVMPlot:
     N_SPLITS: int = 4
     RANDOM_STATE: int = 47
     threshold = UnitFloat(threshold)

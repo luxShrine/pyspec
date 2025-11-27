@@ -87,7 +87,9 @@ class Preds:
             n_pixels = self.true.shape[0]
             self.pred = np.zeros((n_pixels, pred_dim), dtype=np.float32)
 
-    def store(self, preds: np.ndarray, indices: np.ndarray, fold_loss: FoldLoss):
+    def store(
+        self, preds: np.ndarray, indices: np.ndarray, fold_loss: FoldLoss
+    ) -> None:
         indices = np.asarray(indices, dtype=np.int64)
         if preds.shape[0] != indices.size:
             raise ValueError(
@@ -104,7 +106,7 @@ class Preds:
 
     def get_pred(
         self, idx: tuple[slice, int] | tuple[int, ...] | tuple[slice, ...] | None = None
-    ):
+    ) -> tuple[np.ndarray, np.ndarray]:
         if self.pred is None:
             raise RuntimeError("Attempted to retrieve None type predictions")
 
@@ -157,7 +159,7 @@ class Stats:
     def get_loss(self) -> EpochLosses:
         return EpochLosses(_fold_loss=self.epoch_loss)
 
-    def get_pred(self):
+    def get_pred(self) -> tuple[ArrayF32, ArrayF32]:
         assert self.pred_orig is not None
         return self._prc, self.pred_orig
 

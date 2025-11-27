@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -149,7 +150,9 @@ class FoldStat:
 # -- pixel to class -------------------------------------------------------
 
 
-def convert_to_class(pres: float, *, maybe_value: float | None = 0.5):
+def convert_to_class(
+    pres: float, *, maybe_value: float | None = 0.5
+) -> UnitFloat | None:
     """converts presence from ∈ {0,2} to ∈ {0,1}.
 
     Args:
@@ -176,7 +179,9 @@ def convert_arr_to_class(
     )
 
 
-def make_pca_features(X_train: np.ndarray, X_test: np.ndarray, n_components: int = 10):
+def make_pca_features(
+    X_train: np.ndarray, X_test: np.ndarray, n_components: int = 10
+) -> tuple[np.ndarray, np.ndarray, PCA, StandardScaler]:
     # standardize per-band
     scaler = StandardScaler(with_mean=True, with_std=True)
     X_train_sc = scaler.fit_transform(X_train)
@@ -192,7 +197,7 @@ def make_pca_features(X_train: np.ndarray, X_test: np.ndarray, n_components: int
 
 
 # TODO:
-def get_concentration(absorption: ArrayF, k: ArrayF):
+def get_concentration(absorption: ArrayF, k: ArrayF) -> ArrayF:
     # Regression, we can use least squares to measure concentration:
     # minimizing function: S = \sum_i=1^n (y_i - f_i)^2
     # => c = (K^T A) / (K^T K)
@@ -250,7 +255,7 @@ class RegionSet:
         self.mid_distance = 2 * r2
         self.hi_distance = 2 * r3
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[tuple[float, float], float]]:
         win = [self.lo_window, self.mid_window, self.hi_window]
         dist = [self.lo_distance, self.mid_distance, self.hi_distance]
         yield from zip(win, dist)
@@ -298,7 +303,7 @@ def _log_ratio_area(
     clip_ratio = np.clip(raw_ratio, 1e-5, 1e5)
     if raw_ratio != clip_ratio:
         logger.debug(f"Clipping ratio {raw_ratio} -> {clip_ratio}")
-    return np.log(clip_ratio)
+    return float(np.log(clip_ratio))
 
 
 def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF) -> tuple[float, float]:
@@ -338,9 +343,11 @@ class PresenceMap:
     mid: np.float64
     hi: np.float64
 
-    def __array__(self, dtype: np.dtype | None = None, copy: bool | None = None):
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         arr = np.asarray([self.lo, self.mid, self.hi], dtype=dtype)
-        return arr.copy if copy else arr
+        return arr.copy() if copy else arr
 
     @classmethod
     def from_ratios(cls, ratios: list[np.float64]) -> PresenceMap:
@@ -363,7 +370,9 @@ class SpectraBandFeatures:
     presence_map: PresenceMap
     dims: Dimensions
 
-    def __array__(self, dtype: np.dtype | None = None, copy: bool | None = None):
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         if copy is False:
             raise ValueError("`copy=False` isn't supported. A copy is always created.")
 
