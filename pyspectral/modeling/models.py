@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import sys
 from typing import Any, override
 
 from beartype import beartype
@@ -10,6 +12,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from pyspectral.config import MODELS_DIR
 from pyspectral.data.features import FoldStat
 from pyspectral.types import ArrayF32, ClassModelType, SpecModelType
 
@@ -25,6 +28,33 @@ type MaskTensor = Bool[Tensor, "B T"]
 
 type BatchPrep = tuple[tuple[Tensor, ...], Tensor, Tensor | None]
 type ModelOutput = nn.Module | Tensor | tuple | list
+
+
+def _get_pt_file(directory: Path = MODELS_DIR, fold_number: int = 0) -> Path:
+    models = directory.glob(".pt")
+    mod_list = list(filter(lambda x: str(fold_number) in x.as_posix(), models))
+    options = len(mod_list)
+    if options == 0:
+        raise FileNotFoundError(f"No '.pt' files found in {MODELS_DIR}")
+    elif options == 1:
+        model = mod_list[0]
+        logger.debug(f"Only one model found, loading model at: {model}")
+        return model
+    else:
+        while True:
+            for m in mod_list:
+                print(f"Use the model at: {m}")
+                inp = input("Enter (y/n): ").lower()
+                if inp == "y":
+                    return m
+                else:
+                    continue
+
+            inp2 = input("No model selected, go through options again? (y/n):").lower()
+            if inp2 == "y":
+                continue
+            else:
+                sys.exit()
 
 
 def _prepare_batch(
@@ -118,6 +148,15 @@ class MILMeanHeadMulti(nn.Module):
     def pred(self, input: tuple[Tensor, ...]) -> Tensor:
         return _prediction_from_output(self(*input))
 
+    @classmethod
+    def load(
+        cls, d_in: int, *, hidden: int = 64, n_classes: int = 3, fold_number: int = 0
+    ) -> MILMeanHeadMulti:
+        model_path = _get_pt_file(fold_number=fold_number)
+        model = cls(d_in, hidden=hidden, n_classes=n_classes)
+        model.load_state_dict(torch.load(model_path))
+        return model
+
 
 class MILMeanHead(nn.Module):
     def __init__(self, d_in: int, hidden: int = 64):
@@ -158,6 +197,13 @@ class MILMeanHead(nn.Module):
 
     def pred(self, input: tuple[Tensor, ...]) -> Tensor:
         return _prediction_from_output(self(*input))
+
+    @classmethod
+    def load(cls, d_in: int, *, hidden: int = 64, fold_number: int = 0) -> MILMeanHead:
+        model_path = _get_pt_file(fold_number=fold_number)
+        model = cls(d_in, hidden=hidden)
+        model.load_state_dict(torch.load(model_path))
+        return model
 
 
 # -- conv model
