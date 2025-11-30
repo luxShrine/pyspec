@@ -87,6 +87,17 @@ class MaskedValues:
         mask_pos, mask_maybe, mask_neg = cls.get_mask(true_arr)
         return cls(arr[mask_pos], arr[mask_maybe], arr[mask_neg])
 
+    def get_positive_negative_mask(
+        self, *, threshold: float | None = None
+    ) -> np.ndarray[tuple[int], np.dtype[np.int8]]:
+        """Collapse masked labels into binary positives/negatives."""
+        arr = np.concatenate([self.pos, self.neg])
+        if threshold is None:
+            labeled = arr.flatten() > 1
+        else:
+            labeled = arr.flatten() >= threshold
+        return labeled.astype(np.int8, copy=False)
+
 
 # -- Spec to Spec Clasical Predict -------------------------------------------------------
 
