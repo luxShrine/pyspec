@@ -20,6 +20,7 @@ from sklearn.preprocessing import StandardScaler
 import sklearn.svm as svm
 
 from pyspectral.config import READY_DATA_DIR
+from pyspectral.core import TruePredPair
 from pyspectral.data.dataset import KFolds
 from pyspectral.data.io import (
     ClassPair,
@@ -47,6 +48,7 @@ from pyspectral.result.predict import (
 from pyspectral.types import (
     Arr2DF,
     ArrayF,
+    BaselinePolynomialDegree,
     SpecModelType,
     UnitFloat,
 )
@@ -102,11 +104,11 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
         prep.PreConfig(
             smoothing=None,
             spike_kernel_size=1,
-            baseline=prep.BaselinePolynomialDegree(1),
+            baseline=BaselinePolynomialDegree(1),
         ),
-        prep.PreConfig(smoothing=None, baseline=prep.BaselinePolynomialDegree(2)),
+        prep.PreConfig(smoothing=None, baseline=BaselinePolynomialDegree(2)),
         prep.PreConfig(
-            smoothing=prep.SmoothCfg(), baseline=prep.BaselinePolynomialDegree(2)
+            smoothing=prep.SmoothCfg(), baseline=BaselinePolynomialDegree(2)
         ),
     ]
     models = [SpecModelType.LRSM, SpecModelType.LSM]
@@ -165,7 +167,6 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
 
 @dataclass
 class PredCompare:
-    cm: np.ndarray[tuple[int, int]]
     true: MaskedValues
     pred: MaskedValues
     iou: float
@@ -173,11 +174,13 @@ class PredCompare:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PredCompare:
         return cls(
-            cm=d["cm"],
             true=MaskedValues.from_dict(d["true"]),
             pred=MaskedValues.from_dict(d["pred"]),
             iou=d["iou"],
         )
+
+    def get_true_pred(self) -> TruePredPair:
+        return TruePredPair(np.asarray(self.true), np.asarray(self.pred))
 
 
 @dataclass
@@ -186,11 +189,6 @@ class MLSVMPlot:
     ml_loss: oof.EpochLosses
     pca_cmp: PredCompare
     svc_preds: list[SVCPred]
-
-    def get_cm(self) -> tuple[ConfusionMatrixDisplay, ConfusionMatrixDisplay]:
-        disp_ml = ConfusionMatrixDisplay(self.ml_cmp.cm)
-        disp_cm = ConfusionMatrixDisplay(self.pca_cmp.cm)
-        return disp_ml, disp_cm
 
     def get_mse(self) -> tuple[float, float, float, float]:
         ml_pred = self.ml_cmp.pred
@@ -236,35 +234,13 @@ class MLSVMPlot:
         return None
 
 
-def _get_positive_negative_mask(
-    mask: MaskedValues, *, threshold: float | None = None
-) -> np.ndarray[tuple[int], np.dtype[np.int8]]:
-    """Collapse masked labels into binary positives/negatives."""
-    arr = np.concatenate([mask.pos, mask.neg])
-    if threshold is None:
-        labeled = arr.flatten() > 1
-    else:
-        labeled = arr.flatten() >= threshold
-    return labeled.astype(np.int8, copy=False)
-
-
-def _make_confusion_matrix(
-    true_mask: MaskedValues, pred_mask: MaskedValues, threshold: UnitFloat
-) -> np.ndarray[tuple[int, int]]:
-    true_pn = _get_positive_negative_mask(true_mask)  # label 2 → 1
-    pred_pn = _get_positive_negative_mask(pred_mask, threshold=float(threshold))
-    return confusion_matrix(true_pn, pred_pn)
-
-
 def _do_ml_predict(
     class_pair: ClassPair,
     epochs: int,
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
-) -> tuple[
-    PredCompare, oof.EpochLosses, np.ndarray[tuple[int], np.dtype[np.float32]]
-]:
+) -> tuple[PredCompare, oof.EpochLosses, np.ndarray[tuple[int], np.dtype[np.float32]]]:
     oof_stats = train_pixel(
         class_pair,
         n_splits=N_SPLITS,
@@ -279,13 +255,13 @@ def _do_ml_predict(
     ml_true_masked = MaskedValues.build(true, true)
     ml_pred_masked = MaskedValues.build(pred, true)
 
-    ml_cm = _make_confusion_matrix(ml_true_masked, ml_pred_masked, threshold)
+    # ml_cm = _make_confusion_matrix(ml_true_masked, ml_pred_masked, threshold)
 
     ml_probs = pred.flatten()
     baseline = true_flat > 1
     ml_mask = ml_probs >= threshold
     ml_iou = compute_iou_from_masks(baseline, ml_mask)
-    ml_cmp = PredCompare(cm=ml_cm, true=ml_true_masked, pred=ml_pred_masked, iou=ml_iou)
+    ml_cmp = PredCompare(true=ml_true_masked, pred=ml_pred_masked, iou=ml_iou)
     return ml_cmp, ml_loss, true_flat
 
 
@@ -322,7 +298,6 @@ def _do_pca_svm_predict(
         ]
     )
 
-    # pyright: ignore[reportAssignmentType]
     svc_prob: np.ndarray[tuple[int, int]] = cross_val_predict(
         pipeline, X=X_pix, y=y_binary, cv=cv_indices, method="predict_proba"
     )
@@ -333,14 +308,12 @@ def _do_pca_svm_predict(
     svc_pred_masked = MaskedValues.build(svc_pos_probs, true_flat)
 
     # confusion matrix from thresholded probs
-    pca_cm = _make_confusion_matrix(svc_true_masked, svc_pred_masked, threshold)
+    # pca_cm = _make_confusion_matrix(svc_true_masked, svc_pred_masked, threshold)
 
     svc_mask = svc_pos_probs >= float(threshold)
     svc_iou = compute_iou_from_masks((true_flat > 1), svc_mask)
 
-    pca_cmp = PredCompare(
-        cm=pca_cm, true=svc_true_masked, pred=svc_pred_masked, iou=svc_iou
-    )
+    pca_cmp = PredCompare(true=svc_true_masked, pred=svc_pred_masked, iou=svc_iou)
 
     pipeline.fit(X_pix, y_binary)
     scaler = pipeline.named_steps["scaler"]
