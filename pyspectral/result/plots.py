@@ -10,11 +10,12 @@ import numpy as np
 from scipy.ndimage import binary_erosion, uniform_filter, zoom
 from skimage.filters import threshold_otsu
 from skimage.morphology import reconstruction
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 
 from pyspectral.config import REF_PHE
-from pyspectral.core import Cube
+from pyspectral.core import Cube, TruePredPair
 from pyspectral.result.compare import ClassicalPredict, FoldPlot, MLSVMPlot
-from pyspectral.result.predict import PredictData
+from pyspectral.result.predict import MaskedValues, PredictData
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
@@ -253,10 +254,10 @@ def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, fl
     _fig, axes = plt.subplots(r, c, dpi=200)
     axes: list[Axes] = np.atleast_1d(axes).flatten().tolist()  # pyright: ignore[reportCallIssue, reportArgumentType]
     for ax, (base, edge, title) in zip(axes, imgs):
-        ax.imshow(base, cmap="gray")  # pyright: ignore[reportArgumentType]
+        ax.imshow(base, cmap="gray")
         if edge is not None:
-            overlay = np.zeros((*edge.shape, 4), float)  # pyright: ignore[reportCallIssue, reportArgumentType]
-            overlay[edge] = (1, 0, 0, 0.9)
+            overlay = np.zeros((*edge.shape, 4), float)
+            overlay[edge] = (1, 0, 0, 0.9)  # pyright: ignore[reportCallIssue, reportArgumentType]
             ax.imshow(overlay)
         ax.set_title(title, {"fontsize": 8}, loc="center", wrap=True)
         ax.set_axis_off()
@@ -387,15 +388,27 @@ def plot_loss_comparison(
     plt.show()
 
 
-# def plot_confusion(
-#     data: PredictData,
-# ) -> None:
-#     from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
-#
-#     cm = confusion_matrix(data.train_pred, data.test_pred, labels=data.labels )
-#     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=data.labels)
-#     disp.plot()
-#     plt.show()
+def _make_confusion_matrix(
+    true_values: MaskedValues, pred_values: MaskedValues, threshold: UnitFloat
+) -> np.ndarray[tuple[int, int]]:
+    true_pn = true_values.get_positive_negative_mask()  # label 2 → 1
+    pred_pn = pred_values.get_positive_negative_mask(threshold=float(threshold))
+    return confusion_matrix(true_pn, pred_pn)
+
+
+def plot_confusion(
+    true_pred_pair: TruePredPair, *, labels: np.ndarray | None = None
+) -> None:
+    """
+    display_labels: ndarray of shape (n_classes,), labels for plot.
+    If None, display labels are set from 0 to
+
+    """
+    cm = confusion_matrix(true_pred_pair.true, true_pred_pair.pred)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot()
+    plt.show()
+
 
 # -- Pixel Plots -------------------------------------------------------
 
@@ -510,14 +523,46 @@ def svc_boundary(
     plt.show()
 
 
-def do_MLSVM_plots(data: MLSVMPlot) -> None:
+def plot_roc_auc(
+    pred_pos: np.ndarray, pred_neg: np.ndarray, *, count: int = 100
+) -> None:
+    threshold_arr = np.linspace(0, 1, count)
+
+    false_positive_rate = []
+    true_positive_rate = []
+
+    total_count_p = pred_pos.size
+    total_count_f = pred_neg.size
+    for r in threshold_arr:
+        pred_tp = np.where(pred_pos > r, 1, 0)
+        pred_tp_count = np.count_nonzero(pred_tp)
+        ratio_tp = (pred_tp_count) / total_count_p
+        true_positive_rate.append(ratio_tp)
+
+        pred_fp = np.where(pred_neg > r, 1, 0)
+        pred_fp_count = np.count_nonzero(pred_fp)
+        ratio_fp = (pred_fp_count) / total_count_f
+        false_positive_rate.append(ratio_fp)
+
+    plt.plot(false_positive_rate, true_positive_rate, label="ML learning curve)")
+    plt.plot([0, 1], "r--", label="m=0.5 (No learning curve)")
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.legend()
+    plt.show()
+
+
+def do_MLSVM_plots(data: MLSVMPlot, threshold: float = 0.5) -> None:
+    threshold = UnitFloat(threshold)
     # ML first
     ml = data.ml_cmp
-    plot_pixel_histogram(ml.pred.pos, ml.pred.neg, ml.pred.maybe)
+    plot_pixel_histogram(ml.pred.pos, ml.pred.neg, ml.pred.maybe, threshold=threshold)
 
     # PCA plots
     pca = data.pca_cmp
-    plot_pixel_histogram(pca.pred.pos, pca.pred.neg, pca.pred.maybe, bins=25)
+    plot_pixel_histogram(
+        pca.pred.pos, pca.pred.neg, pca.pred.maybe, threshold=threshold, bins=25
+    )
 
     # keep positive & negative
     svc = data.svc_preds[0]
