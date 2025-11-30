@@ -35,6 +35,12 @@ def assert_same_grid(a: ArrayF, b: ArrayF, tolerance: float = 1e-9) -> None | st
     return None
 
 
+@dataclass
+class TruePredPair:
+    true: np.ndarray
+    pred: np.ndarray
+
+
 @dataclass(frozen=True, slots=True)
 class TestResult:
     test_loss: float
