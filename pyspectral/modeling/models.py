@@ -545,6 +545,7 @@ def get_loss_managers(
     wd: float = 1e-4,
 ) -> tuple[nn.CrossEntropyLoss | nn.BCELoss | nn.MSELoss, torch.optim.Optimizer]:
     """Create the optimizer and loss function."""
+    loss_fn: nn.CrossEntropyLoss | nn.BCELoss | nn.MSELoss
     if isinstance(model, ConvSpectralClassifier) or isinstance(model, MILMeanHeadMulti):
         loss_fn = nn.CrossEntropyLoss()
     elif isinstance(model, MILMeanHead):

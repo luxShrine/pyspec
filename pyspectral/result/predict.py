@@ -126,10 +126,6 @@ class PredCompare:
     def get_true_pred(self) -> TruePredPair:
         return TruePredPair(np.asarray(self.true), np.asarray(self.pred))
 
-    def rmse_per_pixel(self) -> ArrayF32:
-        tp = self.get_true_pred()
-        return np.sqrt(((tp.pred - tp.true) ** 2).mean(axis=-1, dtype=np.float32))
-
 
 # -- Spec to Spec Clasical Predict -------------------------------------------------------
 
@@ -408,7 +404,7 @@ def pred_SVC(
 def ml_class_predict_pixel(hsi_map: HSIMap, threshold: float = 0.5) -> PredCompare:
     wl = hsi_map.wl
     region = RegionSet()
-    flatfeats = [create_specband_feats(xi, wl, region) for xi in hsi_map.spectra]
+    flatfeats = [create_specband_feats(xi, wl, region) for xi in iter(hsi_map.spectra)]
     feats: Arr2DF32 = np.vstack(flatfeats).astype(np.float32, copy=False)
 
     device = torch.device("cpu")
@@ -446,11 +442,17 @@ def svm_class_predict_pixel(
     where 1 denotes the positive class (alginate).
     """
     # Features must match training-time features exactly
-    pixels = hsi_map.spectra.get_pixels()  # shape (Npix, C)
+    # pixels = hsi_map.spectra.get_pixels()  # shape (Npix, C)
+    pixels = np.asarray(hsi_map.spectra)
     true = hsi_map.presence.map.flatten()
 
     svc = pipeline.named_steps["svc"]
     classes = svc.classes_
+
+    # WARN: DEBUG
+    print("SVM classes:", classes)  # should be [0 1]
+    p_pos = pipeline.predict_proba(pixels)[:, 1]
+    print(p_pos.min(), p_pos.max())
 
     if classes.size != 2:
         raise ValueError(f"Expected binary SVM, got classes {classes!r}")
@@ -461,7 +463,7 @@ def svm_class_predict_pixel(
 
     prob = pipeline.predict_proba(pixels)[:, pos_idx].astype(np.float32, copy=False)
 
-    # binary mask for IoU consistent with the rest of your code
+    # binary mask for IoU consistent
     baseline = true > 1  # label 2 = positive
     pred_mask = prob >= threshold
 

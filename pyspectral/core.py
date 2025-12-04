@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -76,10 +77,10 @@ class FlatMap:
     def __len__(self) -> int:
         return self.N
 
-    def __getitem__(self, key: slice | int) -> Any | ArrayF32:
+    def __getitem__(self, key: slice | int) -> ArrayF:
         return self._array[key]
 
-    def __iter__(self):
+    def __iter__(self) -> Generator[ArrayF, None, None]:
         yield from self._array
 
     def get_pixels(self) -> list[Arr1DF]:
@@ -87,7 +88,7 @@ class FlatMap:
         return [self._array[i] for i in pixel_indices]
 
     @classmethod
-    def from_dict(cls, d: dict) -> FlatMap:
+    def from_dict(cls, d: dict[str, Any]) -> FlatMap:
         return cls(_array=np.array(d["_array"]), N=d["N"], C=d["C"])
 
     @property
@@ -178,10 +179,14 @@ class Cube:
         flat = self.flatten()
         flat_labels = labels.reshape(-1)  # (H*W,)
 
-        class_names = {0: "negatives", 1: "maybe", 2: "samples"}
+        class_names: dict[int, Literal["negatives", "maybe", "samples"]] = {
+            0: "negatives",
+            1: "maybe",
+            2: "samples",
+        }
         spectra_by_class: SpectraByClass = {"negatives": [], "maybe": [], "samples": []}
 
-        for spec, lab in zip(flat, flat_labels):
+        for spec, lab in zip(iter(flat), flat_labels):
             spectra_by_class[class_names[int(lab)]].append(spec)
 
         return spectra_by_class
@@ -192,7 +197,7 @@ class Cube:
         return (self.H, self.W, self.M)
 
     @classmethod
-    def from_dict(cls, d: dict) -> Cube:
+    def from_dict(cls, d: dict[str, Any]) -> Cube:
         return cls(_cube=np.array(d["_cube"]), H=d["H"], W=d["W"], M=d["M"])
 
     @classmethod
