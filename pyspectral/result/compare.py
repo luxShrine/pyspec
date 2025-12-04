@@ -10,8 +10,6 @@ from loguru import logger
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
-    confusion_matrix,
     root_mean_squared_error,
 )
 from sklearn.model_selection import cross_val_predict
@@ -20,17 +18,8 @@ from sklearn.preprocessing import StandardScaler
 import sklearn.svm as svm
 
 from pyspectral.config import READY_DATA_DIR
-from pyspectral.core import TruePredPair
 from pyspectral.data.dataset import KFolds
-from pyspectral.data.io import (
-    ClassPair,
-    DataArtifacts,
-    SpectraPair,
-    build_classification,
-    read_pairs,
-    restore_arrays,
-    save_outer,
-)
+import pyspectral.data.io as io
 import pyspectral.data.preprocessing as prep
 from pyspectral.modeling.models import BandPenalty
 import pyspectral.modeling.oof as oof
@@ -41,9 +30,13 @@ from pyspectral.modeling.train import (
 )
 from pyspectral.result.predict import (
     MaskedValues,
+    PredCompare,
     SVCPred,
+    create_svm_pipeline,
+    ml_class_predict_pixel,
     multitask_elasticnet_predict,
     pcr_predict,
+    svm_class_predict_pixel,
 )
 from pyspectral.types import (
     Arr2DF,
@@ -122,13 +115,13 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
     loss_plot_data = []
     permutations = list(product(ranks, lrs, n_splits, model_penalties, pre_processing))
     logger.debug(f"Number of configs comparing: {len(permutations)}")
-    rows = read_pairs(csv, data)
+    rows = io.read_pairs(csv, data)
     # iterate across each rank, and then CNN then against classical method
     for r, lr, n, mp, pre in permutations:
         mt, li, od, ba, bi = mp
         train_settings = f"{r=}|{lr=}|{li=}|{od=}|{ba=}|{bi=}|{n=}|{pre}|{mt}"
         print(train_settings)
-        spectra, arts = SpectraPair.from_annotations(
+        spectra, arts = io.SpectraPair.from_annotations(
             rows, peak_cfg=peak_config, pre_config=pre
         )
 
@@ -149,7 +142,7 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
         print(20 * "-")
 
     # PCR/ElasticNet comparison
-    classical, _ = SpectraPair.from_annotations(rows)
+    classical, _ = io.SpectraPair.from_annotations(rows)
     true = classical.Y_proc
     cv, _split_iter = KFolds(
         n_splits=n_splits[0], raw_data=classical.X_raw
@@ -163,24 +156,6 @@ def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
 
 
 # -- Compare Spec to Class -------------------------------------------------------
-
-
-@dataclass
-class PredCompare:
-    true: MaskedValues
-    pred: MaskedValues
-    iou: float
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> PredCompare:
-        return cls(
-            true=MaskedValues.from_dict(d["true"]),
-            pred=MaskedValues.from_dict(d["pred"]),
-            iou=d["iou"],
-        )
-
-    def get_true_pred(self) -> TruePredPair:
-        return TruePredPair(np.asarray(self.true), np.asarray(self.pred))
 
 
 @dataclass
@@ -219,7 +194,7 @@ class MLSVMPlot:
         )
 
     def save_to_file(self, path: Path) -> None:
-        save_outer(self, path=path)
+        io.save_outer(self, path=path)
 
     @classmethod
     def from_file(cls, path: Path) -> MLSVMPlot | None:
@@ -227,15 +202,15 @@ class MLSVMPlot:
         with path.with_suffix(".json").open() as f:
             meta = json.load(f)
 
-        restored = restore_arrays(meta, arrays)
+        restored = io.restore_arrays(meta, arrays)
         # reconstruct as nested dict/list/scalars
         if isinstance(restored, dict):
             return cls.from_dict(restored)
         return None
 
 
-def _do_ml_predict(
-    class_pair: ClassPair,
+def _do_ml_train(
+    class_pair: io.ClassPair,
     epochs: int,
     threshold: UnitFloat,
     N_SPLITS: int,
@@ -265,40 +240,40 @@ def _do_ml_predict(
     return ml_cmp, ml_loss, true_flat
 
 
+def _get_fitted_pipeline(
+    pipeline: Pipeline, X: Arr2DF, y: np.ndarray
+) -> tuple[StandardScaler, PCA, svm.SVC, Pipeline]:
+    pipeline.fit(X, y)
+    scaler = pipeline.named_steps["scaler"]
+    pca = pipeline.named_steps["pca"]
+    svc: svm.SVC = pipeline.named_steps["svc"]
+    return scaler, pca, svc, pipeline
+
+
+def _get_binary_map(arts: io.DataArtifacts) -> tuple[np.ndarray, np.ndarray]:
+    presence_maps = np.concatenate([x.map.flatten() for x in arts.presences])
+    return ((presence_maps == 2.0).astype(np.int32, copy=False), presence_maps)
+
+
 def _do_pca_svm_predict(
     X_pix: Arr2DF,
-    arts: DataArtifacts,
+    arts: io.DataArtifacts,
     k: int,
     true_flat: np.ndarray[tuple[int]],
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
 ) -> tuple[PredCompare, list[SVCPred]]:
-    presence_maps = np.concatenate([x.map.flatten() for x in arts.presences])
-    y_binary = (presence_maps == 2.0).astype(np.int32, copy=False)
+    y_binary, presence_maps = _get_binary_map(arts)
 
     splits = KFolds(N_SPLITS, X_pix, RANDOM_STATE)
     cv_indices = [
         (tr_idx, te_idx) for tr_idx, te_idx, _, _ in splits.scene_cv_pixel_indices(arts)
     ]
 
-    pipeline = Pipeline(
-        [
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("pca", PCA(n_components=k, svd_solver="full")),
-            (
-                "svc",
-                svm.SVC(
-                    kernel="linear",
-                    probability=True,
-                    class_weight="balanced",
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-        ]
-    )
+    pipeline = create_svm_pipeline(k, RANDOM_STATE)
 
-    svc_prob: np.ndarray[tuple[int, int]] = cross_val_predict(
+    svc_prob: np.ndarray[tuple[int, int]] = cross_val_predict(  # pyright: ignore[reportAssignmentType]
         pipeline, X=X_pix, y=y_binary, cv=cv_indices, method="predict_proba"
     )
     svc_pos_probs = np.asarray(svc_prob[:, 1], dtype=np.float32)
@@ -307,18 +282,11 @@ def _do_pca_svm_predict(
     svc_true_masked = MaskedValues.build(true_flat, true_flat)
     svc_pred_masked = MaskedValues.build(svc_pos_probs, true_flat)
 
-    # confusion matrix from thresholded probs
-    # pca_cm = _make_confusion_matrix(svc_true_masked, svc_pred_masked, threshold)
-
     svc_mask = svc_pos_probs >= float(threshold)
     svc_iou = compute_iou_from_masks((true_flat > 1), svc_mask)
 
     pca_cmp = PredCompare(true=svc_true_masked, pred=svc_pred_masked, iou=svc_iou)
-
-    pipeline.fit(X_pix, y_binary)
-    scaler = pipeline.named_steps["scaler"]
-    pca = pipeline.named_steps["pca"]
-    svc_model: svm.SVC = pipeline.named_steps["svc"]
+    scaler, pca, svc_model, _ = _get_fitted_pipeline(pipeline, X_pix, y_binary)
 
     x_scaled = scaler.transform(X_pix)
     x_pca: np.ndarray[tuple[int, ...], np.dtype[np.float32]] = np.asarray(
@@ -336,13 +304,13 @@ def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> ML
     N_SPLITS: int = 4
     RANDOM_STATE: int = 47
     threshold = UnitFloat(threshold)
-    class_pair = build_classification(READY_DATA_DIR)
+    class_pair = io.build_classification(READY_DATA_DIR)
     arts = class_pair.arts
     X_pix: Arr2DF = class_pair.all_flatmaps  # (N, C)
 
     # -- ML -------------------------------------------------------
 
-    ml_cmp, ml_loss, true_flat = _do_ml_predict(
+    ml_cmp, ml_loss, true_flat = _do_ml_train(
         class_pair, epochs, threshold, N_SPLITS, RANDOM_STATE
     )
 
@@ -355,3 +323,22 @@ def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> ML
     return MLSVMPlot(
         ml_cmp=ml_cmp, ml_loss=ml_loss, pca_cmp=pca_cmp, svc_preds=svc_preds
     )
+
+
+def class_pixel(path_to_map: Path) -> tuple[PredCompare, PredCompare]:
+    hsi_map = io.HSIMap.from_processed(path_to_map)
+    if hsi_map is None:
+        raise RuntimeError
+
+    ml_prediction = ml_class_predict_pixel(hsi_map)
+
+    # fit pipeline on all data
+    class_pair = io.build_classification(READY_DATA_DIR)
+    arts = class_pair.arts
+    y, _ = _get_binary_map(arts)
+    x: Arr2DF = class_pair.all_flatmaps  # (N, C)
+    pipeline = create_svm_pipeline(10, 47)
+    _, _, _, pipeline = _get_fitted_pipeline(pipeline, X=x, y=y)
+    # predict on the particular pixels from the map
+    svc_prediction = svm_class_predict_pixel(hsi_map, pipeline)
+    return ml_prediction, svc_prediction

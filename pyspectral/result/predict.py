@@ -10,18 +10,28 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import MultiTaskElasticNetCV, RidgeCV
 from sklearn.metrics import root_mean_squared_error
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 import sklearn.svm as svm
+import torch
 from tqdm.auto import tqdm
 
-from pyspectral.core import Cube
+from pyspectral.core import Cube, TruePredPair
 from pyspectral.data.dataset import CrossValidator, KFolds
-from pyspectral.data.features import FoldStat, fit_diag_affine, predict_diag_affine
-from pyspectral.data.io import read_pairs
+from pyspectral.data.features import (
+    FoldStat,
+    RegionSet,
+    create_specband_feats,
+    fit_diag_affine,
+    predict_diag_affine,
+)
+from pyspectral.data.io import HSIMap, read_pairs
 from pyspectral.data.preprocessing import (
     find_peak_in_window,
 )
+from pyspectral.modeling.models import MILMeanHead
 from pyspectral.modeling.oof import Stats
-from pyspectral.types import Arr1DF, ArrayF
+from pyspectral.modeling.train import compute_iou_from_masks, pred_to_numpy
+from pyspectral.types import Arr1DF, Arr2DF32, ArrayF, ArrayF32
 
 # -- general helpers -------------------------------------------------------
 
@@ -97,6 +107,28 @@ class MaskedValues:
         else:
             labeled = arr.flatten() >= threshold
         return labeled.astype(np.int8, copy=False)
+
+
+@dataclass
+class PredCompare:
+    true: MaskedValues
+    pred: MaskedValues
+    iou: float
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> PredCompare:
+        return cls(
+            true=MaskedValues.from_dict(d["true"]),
+            pred=MaskedValues.from_dict(d["pred"]),
+            iou=d["iou"],
+        )
+
+    def get_true_pred(self) -> TruePredPair:
+        return TruePredPair(np.asarray(self.true), np.asarray(self.pred))
+
+    def rmse_per_pixel(self) -> ArrayF32:
+        tp = self.get_true_pred()
+        return np.sqrt(((tp.pred - tp.true) ** 2).mean(axis=-1, dtype=np.float32))
 
 
 # -- Spec to Spec Clasical Predict -------------------------------------------------------
@@ -250,6 +282,24 @@ def predict_cube(
 # -- spec to class -------------------------------------------------------
 
 
+def create_svm_pipeline(k: int, RANDOM_STATE: int) -> Pipeline:
+    return Pipeline(
+        [
+            ("scaler", StandardScaler(with_mean=True, with_std=True)),
+            ("pca", PCA(n_components=k, svd_solver="full")),
+            (
+                "svc",
+                svm.SVC(
+                    kernel="linear",
+                    probability=True,
+                    class_weight="balanced",
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+
 @dataclass
 class SVCPred:
     k: int
@@ -353,3 +403,69 @@ def pred_SVC(
         true_neg=neg,
         true_pos=pos,
     )
+
+
+def ml_class_predict_pixel(hsi_map: HSIMap, threshold: float = 0.5) -> PredCompare:
+    wl = hsi_map.wl
+    region = RegionSet()
+    flatfeats = [create_specband_feats(xi, wl, region) for xi in hsi_map.spectra]
+    feats: Arr2DF32 = np.vstack(flatfeats).astype(np.float32, copy=False)
+
+    device = torch.device("cpu")
+    feat_tensor = torch.from_numpy(feats).unsqueeze(1)  # (Npix, 1, D)
+    mask = torch.ones((feat_tensor.shape[0], feat_tensor.shape[1]), dtype=torch.bool)
+
+    d_in = feat_tensor.shape[-1]
+    model = MILMeanHead.load(d_in=d_in).to(device=device)
+    model.eval()
+
+    with torch.no_grad():
+        pred = model.pred((feat_tensor, mask))
+        prob = pred_to_numpy(pred)  # (Npix,)
+
+    preds_arr = prob.astype(np.float32, copy=False)
+    true = hsi_map.presence.map.flatten()
+
+    pred_mask = preds_arr >= threshold
+    true_mask = true > 1
+    iou = compute_iou_from_masks(true_mask, pred_mask)
+    true_obj = MaskedValues.build(true, true)
+    pred_obj = MaskedValues.build(preds_arr, true)
+    return PredCompare(true_obj, pred_obj, iou)
+
+
+def svm_class_predict_pixel(
+    hsi_map: HSIMap,
+    pipeline: Pipeline,
+    *,
+    threshold: float = 0.5,
+) -> PredCompare:
+    """
+    Evaluate a fitted PCA+SVM pipeline on a new HSI map at pixel level.
+    Assumes the SVC inside pipeline was trained with binary labels {0,1},
+    where 1 denotes the positive class (alginate).
+    """
+    # Features must match training-time features exactly
+    pixels = hsi_map.spectra.get_pixels()  # shape (Npix, C)
+    true = hsi_map.presence.map.flatten()
+
+    svc = pipeline.named_steps["svc"]
+    classes = svc.classes_
+
+    if classes.size != 2:
+        raise ValueError(f"Expected binary SVM, got classes {classes!r}")
+
+    # assume the larger class is the positive one (0/1 -> 1)
+    pos_class_val = classes.max()
+    pos_idx = int(np.where(classes == pos_class_val)[0][0])
+
+    prob = pipeline.predict_proba(pixels)[:, pos_idx].astype(np.float32, copy=False)
+
+    # binary mask for IoU consistent with the rest of your code
+    baseline = true > 1  # label 2 = positive
+    pred_mask = prob >= threshold
+
+    iou = compute_iou_from_masks(baseline, pred_mask)
+    true_obj = MaskedValues.build(true, true)
+    pred_obj = MaskedValues.build(pred_mask, true)
+    return PredCompare(true_obj, pred_obj, iou)
