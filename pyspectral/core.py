@@ -9,6 +9,7 @@ import numpy.typing as npt
 from pyspectral.types import (
     Arr1DF,
     Arr2DF,
+    Arr2DF32,
     Arr3DF32,
     ArrayF,
     ArrayF32,
@@ -39,6 +40,9 @@ def assert_same_grid(a: ArrayF, b: ArrayF, tolerance: float = 1e-9) -> None | st
 class TruePredPair:
     true: np.ndarray
     pred: np.ndarray
+
+    def rmse_per_pixel(self) -> ArrayF32:
+        return np.sqrt(((self.pred - self.true) ** 2).mean(axis=-1, dtype=np.float32))
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +207,7 @@ class Cube:
     @classmethod
     def from_flat(
         cls,
-        flat_cube: np.ndarray[tuple[int, int]],
+        flat_cube: Arr2DF | Arr2DF32,
         height: int,
         width: int,
         spec_bands: int,

@@ -180,7 +180,7 @@ def eval(x: np.ndarray, y: np.ndarray, n_splits: int = 4) -> None:
 
 
 @dataclass
-class PredictData:
+class PredictCubeData:
     pred_cube: Cube
     proc_cube: Cube
     raw_cube: Cube
@@ -199,7 +199,9 @@ class PredictData:
         self.den_center = den_c
 
 
-def predict_cube(idx: int, stats: Stats, base_dir: Path, csv_path: Path) -> PredictData:
+def predict_cube(
+    idx: int, stats: Stats, base_dir: Path, csv_path: Path
+) -> PredictCubeData:
     """
     Grab the indices belonging to that scene, and reshape stats.oof_pred_orig[scene_idx] to (H,W,M).
 
@@ -231,7 +233,7 @@ def predict_cube(idx: int, stats: Stats, base_dir: Path, csv_path: Path) -> Pred
     # (N,C) -> (H*W,M) -> (H,W,M)
     pred_cube = Cube.from_flat(stats.pred_orig[start : (start + n_rows)], H, W, M)
     if (nc := pre_stats[idx].ref_center_cm1) is not None:
-        return PredictData(
+        return PredictCubeData(
             raw_cube=raw_cubes[idx],
             proc_cube=prc_cubes[idx],
             pred_cube=pred_cube,
@@ -286,7 +288,7 @@ class SVCPred:
     ) -> SVCPred:
         return cls(
             k=k,
-            w=svc_model.coef_[0],
+            w=svc_model.coef_[0],  # pyright: ignore[reportIndexIssue]
             b=float(svc_model.intercept_[0]),
             X=x_pca,
             y=presence_maps,
@@ -312,7 +314,7 @@ def pred_SVC(
     clf = svm.SVC(kernel="linear", probability=True, class_weight="balanced")
     clf.fit(X_pca_tr[:, :k], y_train_bin)
 
-    w: Arr1DF = clf.coef_[0]  # shape (k,)
+    w: Arr1DF = clf.coef_[0]  # shape (k,)  # pyright: ignore[reportIndexIssue]
     b: float = clf.intercept_[0]  # scalar
 
     # X: (N, C) -> X[:, :k]: (N, k) -> predict probability:

@@ -72,7 +72,9 @@ def compute_iou_from_masks(
 ) -> float:
     """Compute IoU between two boolean / {0,1} masks."""
     if base_mask.shape != cmp_mask.shape:
-        raise ValueError("Masks must share shape")
+        raise ValueError(
+            f"Masks must share shape: {base_mask.shape=} {cmp_mask.shape=}"
+        )
     base_mask = np.asarray(base_mask, dtype=bool)
     cmp_mask = np.asarray(cmp_mask, dtype=bool)
 
@@ -127,7 +129,7 @@ def create_dataloader[T](
     return (train_dataloader, test_dataloader)
 
 
-def _pred_to_numpy(pred: Tensor) -> ArrayF32:
+def pred_to_numpy(pred: Tensor) -> ArrayF32:
     arr: ArrayF32 = pred.detach().cpu().numpy().astype(np.float32, copy=False)
     while arr.ndim > 1 and arr.shape[-1] == 1:
         arr = arr.squeeze(-1)
@@ -202,7 +204,7 @@ def test_epoch(
     for batch in loader:
         inputs, target, _ = model.prepare(batch, device)
         pred = model.pred(inputs)
-        preds_fold.append(_pred_to_numpy(pred))
+        preds_fold.append(pred_to_numpy(pred))
 
         if isinstance(loss_fn, nn.CrossEntropyLoss):
             target = target.long()

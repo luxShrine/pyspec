@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 from sklearn.metrics import confusion_matrix
 
-from pyspectral.result.compare import _get_positive_negative_mask
 from pyspectral.result.predict import MaskedValues
 
 
@@ -14,8 +13,8 @@ def test_positive_negative_mask_thresholds_predictions() -> None:
     true_masked = MaskedValues.build_with_mask(true, mask_pos, mask_neg, mask_maybe)
     pred_masked = MaskedValues.build_with_mask(pred, mask_pos, mask_neg, mask_maybe)
 
-    y_true = _get_positive_negative_mask(true_masked)
-    y_pred = _get_positive_negative_mask(pred_masked, threshold=0.5)
+    y_true = true_masked.get_positive_negative_mask()
+    y_pred = pred_masked.get_positive_negative_mask(threshold=0.5)
 
     assert np.array_equal(y_true, np.array([1, 1, 0, 0], dtype=np.int8))
     assert np.array_equal(y_pred, np.array([1, 0, 0, 1], dtype=np.int8))

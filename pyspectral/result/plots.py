@@ -15,7 +15,7 @@ from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from pyspectral.config import REF_PHE
 from pyspectral.core import Cube, TruePredPair
 from pyspectral.result.compare import ClassicalPredict, FoldPlot, MLSVMPlot
-from pyspectral.result.predict import MaskedValues, PredictData
+from pyspectral.result.predict import MaskedValues, PredictCubeData
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
@@ -50,7 +50,7 @@ def _get_figure_size(number_plots: int) -> tuple[int, int]:
 # -- helper
 
 
-def _build_loss_plot(loss_type: str | None = None):
+def build_loss_plot(loss_type: str | None = None):
     loss_type = f"({loss_type})" if loss_type is not None else ""
     plt.ylabel(f"Loss {loss_type}")
     plt.xlabel("Epochs (count)")
@@ -141,7 +141,7 @@ def ratio_map(
 
 def safe_den_center(
     den_center: float,
-    stats: PredictData,
+    stats: PredictCubeData,
     *,
     fallback: float = REF_PHE,
     atol: float = 1.0,
@@ -182,7 +182,9 @@ def overlay_boundary(base_img: ArrayF, boundary: ArrayF, title: str, ax: Axes) -
     ax.set_axis_off()
 
 
-def compare_boundaries(plot_data: PredictData, up: bool = False) -> dict[str, float]:
+def compare_boundaries(
+    plot_data: PredictCubeData, up: bool = False
+) -> dict[str, float]:
     """
     Build a ratio boundary.
 
@@ -388,7 +390,25 @@ def plot_loss_comparison(
     plt.show()
 
 
-def _make_confusion_matrix(
+def cm_fpr_fnr(cm: np.ndarray[tuple[int, int]]) -> tuple[float, float]:
+    """Get the false positive and false negative rate from a confusion matrix array.
+
+    cm: Must be a square two dimensional array.
+
+    Returns:
+        False positive rate, false negative rate.
+    """
+    # true false cm[0][0]
+    # true true  cm[1][1]
+    # false true cm[0][1]
+    # false false cm[1][0]
+    total = cm.sum()
+    fpr = cm[0][1] / total
+    ffr = cm[1][0] / total
+    return fpr, ffr
+
+
+def make_confusion_matrix(
     true_values: MaskedValues, pred_values: MaskedValues, threshold: UnitFloat
 ) -> np.ndarray[tuple[int, int]]:
     true_pn = true_values.get_positive_negative_mask()  # label 2 → 1
