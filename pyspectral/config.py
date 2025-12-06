@@ -35,8 +35,14 @@ try:
     logger.add(
         lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True, diagnose=False
     )
+    # file
     logger.add(
-        "app.log", rotation="1 week", level="DEBUG", enqueue=True, serialize=True
-    )  # file
+        f"{PROJ_ROOT}/app.log",
+        rotation="1 week",
+        retention="10 days",
+        level="DEBUG",
+        enqueue=True,
+        serialize=True,
+    )
 except ModuleNotFoundError:
     pass
