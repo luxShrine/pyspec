@@ -7,7 +7,7 @@ import numpy as np
 
 from pyspectral.core import EpochLoss
 from pyspectral.data.features import FoldStat
-from pyspectral.data.io import DataArtifacts
+from pyspectral.data.io import DataArtifacts, Presence
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
@@ -15,6 +15,47 @@ from pyspectral.types import (
     ArrayI,
     IndexArray,
 )
+
+
+def _resize_presence_map(
+    presence_map: np.ndarray[Any, np.dtype[np.float64]],
+    target_hw: tuple[int, int],
+) -> ArrayF32:
+    """Resize presence map to scene shape using nearest-neighbor sampling."""
+    target_h, target_w = target_hw
+    expected_len = int(target_h * target_w)
+    map_arr = np.asarray(presence_map, dtype=np.float32)
+
+    if map_arr.size == expected_len:
+        return map_arr.reshape(target_h, target_w)
+
+    if map_arr.ndim == 2 and map_arr.shape[0] > 0 and map_arr.shape[1] > 0:
+        src_h, src_w = map_arr.shape
+        row_idx = np.minimum(
+            (np.arange(target_h, dtype=np.int64) * src_h) // max(1, target_h),
+            src_h - 1,
+        )
+        col_idx = np.minimum(
+            (np.arange(target_w, dtype=np.int64) * src_w) // max(1, target_w),
+            src_w - 1,
+        )
+        resized: ArrayF32 = np.asarray(
+            map_arr[np.ix_(row_idx, col_idx)], dtype=np.float32
+        )
+        return resized
+
+    flat_map = map_arr.reshape(-1)
+    if flat_map.size == 0:
+        return np.zeros((target_h, target_w), dtype=np.float32)
+
+    flat_idx = np.minimum(
+        (np.arange(expected_len, dtype=np.int64) * flat_map.size) // expected_len,
+        flat_map.size - 1,
+    )
+    resized_flat: ArrayF32 = np.asarray(
+        flat_map[flat_idx].reshape(target_h, target_w), dtype=np.float32
+    )
+    return resized_flat
 
 
 @dataclass(frozen=True)
@@ -111,7 +152,7 @@ class Preds:
             raise RuntimeError("Attempted to retrieve None type predictions")
 
         if idx is not None:
-            return self.true[idx], self.true[idx]
+            return self.true[idx], self.pred[idx]
         return self.true, self.pred
 
 
@@ -171,9 +212,8 @@ class ClassStats:
         self.artifacts: DataArtifacts = artifacts
         self.scene_ids: ArrayI = np.asarray(artifacts.scene_ids)
         # binary presence labels stored for convenience
-        true: ArrayF32 = np.asarray(artifacts.presences, dtype=np.float32).reshape(
-            -1, 1
-        )
+        pres = [1.0 if p.mean >= 0.75 else 0.0 for p in artifacts.presences]
+        true: ArrayF32 = np.asarray(pres, dtype=np.float32).reshape(-1, 1)
         self.stats: Preds = Preds(true)
 
     def store(
@@ -205,14 +245,17 @@ class PxlStats:
         true = np.zeros((n_pixels, 1), dtype=np.float32)
         for scene_idx, presence in enumerate(artifacts.presences):
             sl = artifacts.slices[scene_idx]
-            flat_map = presence.map.reshape(-1).astype(np.float32, copy=False)
-            expected_len = sl.stop - sl.start
-            if flat_map.shape[0] != expected_len:
-                raise ValueError(
-                    "Presence map size mismatch "
-                    + f"for scene {scene_idx}: {flat_map.shape[0]} vs {expected_len}."
+            target_h = int(artifacts.hw[scene_idx, 0])
+            target_w = int(artifacts.hw[scene_idx, 1])
+            aligned_map = _resize_presence_map(presence.map, (target_h, target_w))
+            true[sl, 0] = aligned_map.reshape(-1)
+
+            if presence.map.shape != aligned_map.shape:
+                # Keep artifact labels aligned so downstream pixel datasets train safely.
+                artifacts.presences[scene_idx] = Presence(
+                    mean=np.float64(aligned_map.mean()),
+                    map=aligned_map.astype(np.float64, copy=False),
                 )
-            true[sl, 0] = flat_map
 
         self.stats: Preds = Preds(true)
 

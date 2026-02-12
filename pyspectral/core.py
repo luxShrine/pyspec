@@ -26,15 +26,63 @@ def apply_z(y: np.ndarray, mean: MeanArray, std: StdArray) -> np.ndarray:
 def assert_same_grid(a: ArrayF, b: ArrayF, tolerance: float = 1e-9) -> None | str:
     """Check that array 'a' and 'b' are the same shape and each element is within a tolerance."""
     # add to a single string so that we can see both issues potentially
-    output: str = ""
     if a.shape != b.shape:
-        output += f"Grid {a.shape=} not equal to {b.shape=}.\n"
+        return f"Grid {a.shape=} not equal to {b.shape=}."
     if not np.allclose(a, b, atol=tolerance):
         # np.allclose checks if the element by element array are the samef within tolerance
-        output += f"Grids differ by supplied tolerance: {tolerance}."
-    if output != "":
-        return output
+        return f"Grids differ by supplied tolerance: {tolerance}."
     return None
+
+
+def set_presence_map_encoding(presence_map: np.ndarray):
+    """Normalize presence labels to {0.0, 0.5, 1.0}.
+
+    Supported inputs:
+    - Normalized: {0.0, 0.5, 1.0}
+    - Legacy ternary: {0, 1, 2} where 1=maybe and 2=positive
+    - Binary: {0, 1} where 1=positive
+    """
+    raw = np.asarray(presence_map, dtype=np.float64)
+    if np.isnan(raw).any():
+        raise ValueError("Presence map cannot contain NaN values.")
+    if (raw < 0).any() or (raw > 2).any():
+        raise ValueError("Presence map values must be in [0, 2].")
+
+    uses_legacy_ternary = np.isclose(raw, 2.0).any()
+    if uses_legacy_ternary:
+        # Legacy encoding is ambiguous at value=1.0, so remap with original values.
+        normalized = np.where(np.isclose(raw, 2.0), 1.0, raw)
+        normalized = np.where(np.isclose(raw, 1.0), 0.5, normalized)
+    else:
+        normalized = raw
+
+    valid = (
+        np.isclose(normalized, 0.0)
+        | np.isclose(normalized, 0.5)
+        | np.isclose(normalized, 1.0)
+    )
+    if not np.all(valid):
+        bad = np.unique(normalized[~valid]).tolist()
+        raise ValueError(f"Presence map contains unsupported values: {bad}")
+    return normalized
+
+
+def _label_to_class_name(
+    label: float, *, legacy_ternary: bool
+) -> Literal["negatives", "maybe", "samples"]:
+    if np.isclose(label, 0.0):
+        return "negatives"
+    if legacy_ternary:
+        if np.isclose(label, 1.0):
+            return "maybe"
+        if np.isclose(label, 2.0):
+            return "samples"
+    else:
+        if np.isclose(label, 0.5):
+            return "maybe"
+        if np.isclose(label, 1.0):
+            return "samples"
+    raise ValueError(f"Unsupported class label value: {label}")
 
 
 @dataclass
@@ -162,12 +210,13 @@ class Cube:
 
     def split_cube_by_label(
         self,
-        labels: np.ndarray[tuple[int, int], np.dtype[np.uint]],
+        labels: np.ndarray,
     ) -> SpectraByClass:
         """Flatten cube per class.
 
         Args:
-            labels: 2D array, (H, W), of int values ∈ {0,3}
+            labels: 2D array (H, W) with either legacy {0,1,2}
+                or normalized {0,0.5,1} labels.
         """
         H, W, _ = self.shape
         if (c := labels.shape) != (H, W):
@@ -177,17 +226,14 @@ class Cube:
 
         # Flatten spatial dims
         flat = self.flatten()
-        flat_labels = labels.reshape(-1)  # (H*W,)
+        flat_labels = labels.reshape(-1).astype(np.float64, copy=False)  # (H*W,)
+        legacy_ternary = np.isclose(flat_labels, 2.0).any()
 
-        class_names: dict[int, Literal["negatives", "maybe", "samples"]] = {
-            0: "negatives",
-            1: "maybe",
-            2: "samples",
-        }
         spectra_by_class: SpectraByClass = {"negatives": [], "maybe": [], "samples": []}
 
         for spec, lab in zip(iter(flat), flat_labels):
-            spectra_by_class[class_names[int(lab)]].append(spec)
+            class_name = _label_to_class_name(float(lab), legacy_ternary=legacy_ternary)
+            spectra_by_class[class_name].append(spec)
 
         return spectra_by_class
 

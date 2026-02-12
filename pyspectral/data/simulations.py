@@ -3,12 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypedDict
 
+from loguru import logger
 import numpy as np
 from scipy.signal import savgol_filter
 
 from pyspectral.core import Cube, FlatMap
-from pyspectral.data.preprocessing import ALS, poly_baseline_subtract
+from pyspectral.data.preprocessing import poly_baseline_subtract
 from pyspectral.types import Arr1DF, Arr2DF, ThirdCoeff
+
+
+def _label_to_name(label: float, *, legacy_ternary: bool) -> str:
+    if np.isclose(label, 0.0):
+        return "negatives"
+    if legacy_ternary:
+        if np.isclose(label, 1.0):
+            return "maybe"
+        if np.isclose(label, 2.0):
+            return "samples"
+    else:
+        if np.isclose(label, 0.5):
+            return "maybe"
+        if np.isclose(label, 1.0):
+            return "samples"
+    raise ValueError(f"Unsupported label value: {label}")
 
 
 def find_nearest(array: np.ndarray, point: float) -> np.intp:
@@ -225,7 +242,9 @@ def simulate_Arr1DF_single(
 
 
 def simulate_map_from_labels(
-    labels: np.ndarray[tuple[int, int]],  # (H, W), 0/1/2
+    labels: np.ndarray[
+        tuple[int, int]
+    ],  # (H, W), legacy {0,1,2} or normalized {0,0.5,1}
     nu: Arr1DF,  # (C,)
     stats_by_class: dict[str, ClassSimStats],
     base: PolyCoeffStats | list[Arr1DF],
@@ -234,12 +253,13 @@ def simulate_map_from_labels(
     H, W = labels.shape
     C = nu.shape[0]
     sim_cube = np.zeros((H, W, C), dtype=np.float32)
-
-    id_to_name = {0: "negatives", 1: "maybe", 2: "samples"}
+    legacy_ternary = np.isclose(labels.astype(np.float64), 2.0).any()
 
     for i in range(H):
         for j in range(W):
-            cls_name = id_to_name[int(labels[i, j])]
+            cls_name = _label_to_name(
+                float(labels[i, j]), legacy_ternary=legacy_ternary
+            )
             cls_stats = stats_by_class[cls_name]
             sim_cube[i, j, :] = simulate_Arr1DF_single(nu, cls_stats, base, noise_stats)
 
@@ -249,7 +269,7 @@ def simulate_map_from_labels(
 def simulate_from_single_hsi(
     cube: Cube,  # (H, W, C)
     nu: Arr1DF,  # (C,)
-    labels: np.ndarray,  # (H, W) with 0/1/2
+    labels: np.ndarray,  # (H, W) with legacy {0,1,2} or normalized {0,0.5,1}
     peak_points: tuple[float, ...],  # e.g. (1003.0, 1410.0, 1600.0)
     do_polyfit: bool = False,
 ) -> Cube:
@@ -261,7 +281,7 @@ def simulate_from_single_hsi(
     specs: list[Arr1DF]
     for cls_name, specs in spectra_by_class.items():  # pyright: ignore[reportAssignmentType]
         if len(specs) == 0:
-            raise RuntimeError(f"No pixels for class {cls_name}")
+            logger.warning(f"No pixels for class {cls_name}")
         stats_by_class[cls_name] = ClassSimStats.fit(nu, specs, peak_points)
 
     # Fit global baseline & noise
@@ -326,18 +346,19 @@ def simulate_from_single_hsi_bandwise(
     specs: list[Arr1DF]
     for cls_name, specs in spectra_by_class.items():  # pyright: ignore[reportAssignmentType]
         if len(specs) == 0:
-            raise RuntimeError(f"No pixels for class {cls_name}")
+            logger.warning(f"No pixels for class {cls_name}")
         stats_by_class[cls_name] = BandwiseClassStats.fit(specs)
 
     H, W = labels.shape
     C = nu.shape[0]
     sim = np.zeros((H, W, C), dtype=np.float32)
-
-    id_to_name = {0: "negatives", 1: "maybe", 2: "samples"}
+    legacy_ternary = np.isclose(labels.astype(np.float64), 2.0).any()
 
     for i in range(H):
         for j in range(W):
-            cls_name = id_to_name[int(labels[i, j])]
+            cls_name = _label_to_name(
+                float(labels[i, j]), legacy_ternary=legacy_ternary
+            )
             cls_stats = stats_by_class[cls_name]
             sim[i, j, :] = cls_stats.sample()
 

@@ -17,9 +17,13 @@ dependencies = [
     "ipympl>=0.9.8",
     "jaxtyping>=0.3.3",
     "loguru",
+    "marimo>=0.19.10",
     "matplotlib>=3.10.6",
     "mkdocs",
+    "nbconvert>=7.17.0",
+    "nbformat>=5.10.4",
     "numpy>=2.3.2",
+    "playwright>=1.58.0",
     "polars>=1.33.0",
     "python-dotenv",
     "scikit-image>=0.25.2",
@@ -29,6 +33,7 @@ dependencies = [
     "torchsummary>=1.5.1",
     "torchvision>=0.23.0",
     "tqdm",
+    "ty>=0.0.16",
 ]
 requires-python = "~=3.13.0"
 
@@ -39,6 +44,19 @@ dev = [
     "ipykernel>=6.30.1",
     "mypy>=1.18.2",
 ]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [project.scripts]
 pyspec = "pyspectral.cli:main"

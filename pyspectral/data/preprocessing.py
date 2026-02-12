@@ -500,7 +500,7 @@ def preprocess_cube(
         else peak_cfg
     )
 
-    cube = cube_maybe if isinstance(cube_maybe, Cube) else cube_maybe.cube
+    cube = cube_maybe.cube if not isinstance(cube_maybe, Cube) else cube_maybe
 
     y_flat = cube.flatten()  # (N, M)
     # remove spikes

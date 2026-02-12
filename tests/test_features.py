@@ -78,9 +78,9 @@ def test_smoothcfg_validates_and_smooths() -> None:
 
     cfg = SmoothCfg(window=7, poly=3)
     # create a 2 dimensional array to mimic spectra
-    sample_spectra = np.linspace(0.0, 1.0, 9, dtype=np.float32)
+    sample_spectra = np.linspace(0.0, 1.0, 9, dtype=np.float64)
     spectra = np.tile(sample_spectra, (2, 1))
     smoothed = cfg.smooth(spectra)
 
     assert smoothed.shape == spectra.shape
-    assert smoothed.dtype == np.float32
+    assert smoothed.dtype == np.float64

@@ -18,8 +18,17 @@ def do_conversion() -> None:
         print("Could not find suitable metadata file, exiting.")
         return
 
+    while True:
+        user_input = input("Convert the raw values?")
+        if "y" in user_input or "yes" in user_input:
+            raw_bool = True
+            break
+        elif "n" in user_input or "no" in user_input:
+            raw_bool = False
+            break
+
     print("Converting files...")
-    pi.convert_raw_class(csv=csv, base=DATA_DIR)
+    pi.convert_raw_class(csv=csv, base=DATA_DIR, raw=raw_bool)
 
 
 def main() -> None:

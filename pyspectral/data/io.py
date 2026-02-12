@@ -11,7 +11,7 @@ import numpy as np
 import polars as pl
 
 from pyspectral.config import READY_DATA_DIR
-from pyspectral.core import Cube, FlatMap, assert_same_grid
+from pyspectral.core import Cube, FlatMap, assert_same_grid, set_presence_map_encoding
 from pyspectral.data.preprocessing import (
     PeakNormConfig,
     PreConfig,
@@ -78,7 +78,11 @@ def save_outer(obj: Any, path: Path) -> None:
 
     # save metadata (including array keys)
     with path.with_suffix(".json").open("w") as f:
-        json.dump(meta, f, indent=2)
+        try:
+            json.dump(meta, f, indent=2)
+        except TypeError as te:
+            logger.error(f"Failed to jsondump {obj} at {path}")
+            raise te
 
 
 def restore_arrays(meta: Any, arrays: AnyDict) -> list[Any] | AnyDict:
@@ -136,9 +140,9 @@ class PresenceType:
             raise ValueError(
                 f"Input passed to create presence type was negative: {potential}"
             )
-        if potential > 3:
+        if potential > 2:
             raise ValueError(
-                f"Input passed to create presence type was greater than three: {potential}"
+                f"Input passed to create presence type was greater than two: {potential}"
             )
         return np.float64(potential)
 
@@ -155,14 +159,18 @@ class Presence:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Presence:
-        mean = PresenceType(d["mean"])
+        PresenceType(d["mean"])
         map_arr = np.asarray(d["map"], dtype=np.float64)
-        if (map_arr < 0).any() or (map_arr > 3).any():
-            raise ValueError("Presence map values must be in [0, 3]")
-        return cls(mean=mean.v, map=map_arr)
+        if (map_arr < 0).any() or (map_arr > 2).any():
+            raise ValueError("Presence map values must be in [0, 2]")
+
+        map_arr = set_presence_map_encoding(map_arr)
+        return cls(mean=map_arr.mean(dtype=np.float64), map=map_arr)
 
     @staticmethod
-    def create_map(h: int, w: int, presence: int) -> np.ndarray[tuple[int, int]]:
+    def create_map(
+        h: int, w: int, presence: int | float
+    ) -> np.ndarray[tuple[int, int]]:
         """
         Project out a single value, by labeling each point on the map as
         equal to this value
@@ -246,12 +254,20 @@ def build_artifacts(
     hw = np.array(hw_list, dtype=np.int64)
     scene_ids_arr = np.array(scene_ids, dtype=np.int64)
 
+    # convert to binary presence
+    pres = []
+    for p in pre_art["presences"]:
+        map_arr = set_presence_map_encoding(p.map)
+        pres.append(
+            Presence(mean=np.float64(map_arr.mean(dtype=np.float64)), map=map_arr)
+        )
+
     return DataArtifacts(
         scene_ids=scene_ids_arr,
         preprocess_stats=pre_art["pre_stats"],
         pre_config=pre_config,
         wls=pre_art["wls"],
-        presences=pre_art["presences"],
+        presences=pres,
         lengths=lens,
         hw=hw,
         slices=slices,
@@ -356,7 +372,11 @@ class HSIMap:
                 presence = d["presence"]
                 h, w = cube.H, cube.W
                 mapping = Presence.create_map(h, w, presence)
-                presence = Presence(mean=np.float64(d["presence"]), map=mapping)
+                mapping = set_presence_map_encoding(mapping)
+                presence = Presence(
+                    mean=np.float64(mapping.mean(dtype=np.float64)),
+                    map=mapping,
+                )
             elif ver == 0.3:
                 # presence is a map or boolean
                 presence = Presence.from_dict(d["presence"])
@@ -392,24 +412,44 @@ class HSIMap:
 
 
 def read_class(
-    csv_file: Path, base_dir: Path
+    csv_file: Path, base_dir: Path, raw: bool = True
 ) -> Generator[tuple[HSIMap, AnyDict], Any, None]:
     """Read annotations file to retrieve HSIMaps for purpose of classification."""
 
-    # NOTE: currently discard proc_path
-    optional_col = {"proc_path", "acq_s", "accum"}
+    optional_path = "proc_path" if raw else "raw_path"
+    non_optional_path = "proc_path" if not raw else "raw_path"
+    optional_col = {optional_path, "acq_s", "accum", "height", "width"}
     class_data = SafeData.create(base_dir, csv_file, optional_col)
     base = class_data.base_dir
     opt = class_data.optional_col
 
     # materialize rows
     for r in class_data:
+        presence_val = r["presence"]
+        H = int(r["height"]) if opt else 8
+        W = int(r["width"]) if opt else 8
+        mapping = Presence.create_map(H, W, presence_val)
+        mapping = set_presence_map_encoding(mapping)
+        presence = Presence(
+            mean=np.float64(mapping.mean(dtype=np.float64)), map=mapping
+        )
+
         hsi_map = HSIMap.from_txt(
-            txt_path=base / r["raw_path"],
-            presence=Presence.from_dict(r["presence"]),
+            txt_path=base / r[non_optional_path],
+            presence=presence,
             accumulation=int(r["accum"]) if opt else None,
             acq_time_s=float(r["acq_s"]) if opt else None,
         )
+        # ensure presence map matches the actual grid size
+        h, w = hsi_map.cube.H, hsi_map.cube.W
+        if presence.map.shape != (h, w):
+            mapping = Presence.create_map(h, w, presence_val)
+            mapping = set_presence_map_encoding(mapping)
+            presence = Presence(
+                mean=np.float64(mapping.mean(dtype=np.float64)),
+                map=mapping,
+            )
+            hsi_map = replace(hsi_map, presence=presence)
         yield hsi_map, r
 
 
@@ -420,7 +460,7 @@ def read_class(
 class PairRow:
     raw_path: Path
     proc_path: Path
-    presence: bool
+    presence: float
     accumulation: int | None = None
     acquisition: float | None = None
 
@@ -429,7 +469,8 @@ class PairRow:
         # setup by assuming dimensions, we dont have the dimensions atm.
         h = w = 8
         pres_map = Presence.create_map(h, w, self.presence)
-        pres = Presence(np.float64(self.presence), pres_map)
+        pres_map = set_presence_map_encoding(pres_map)
+        pres = Presence(np.float64(pres_map.mean(dtype=np.float64)), pres_map)
 
         x_map = HSIMap.from_txt(
             self.raw_path,
@@ -449,7 +490,8 @@ class PairRow:
         # match presence to grid properly with known dimensions
         h, w = x_map.cube.H, x_map.cube.W
         pres_map = Presence.create_map(h, w, self.presence)
-        pres = Presence(np.float64(self.presence), pres_map)
+        pres_map = set_presence_map_encoding(pres_map)
+        pres = Presence(np.float64(pres_map.mean(dtype=np.float64)), pres_map)
         x_map = replace(x_map, presence=pres)
         y_map = replace(y_map, presence=pres)
         return (x_map, y_map)
@@ -480,9 +522,13 @@ class SpectraPair:
         if pre_config is None:
             pre_config = PreConfig.make_min()
 
+        ref_grid: ArrayF | None = ref_wl
+
         for r in rows:
             raw_map, prc_map = r.retrieve_maps()
-            same_grid_cubes = raw_map.check_same_wavelength_grid(prc_map, ref_wl)
+            if ref_grid is None:
+                ref_grid = raw_map.wl
+            same_grid_cubes = raw_map.check_same_wavelength_grid(prc_map, ref_grid)
 
             cube_x, cube_y, train_stats = same_grid_cubes.pre_process(
                 pre_config, peak_cfg
@@ -524,7 +570,7 @@ def read_pairs(csv_file: Path | str, base_dir: Path | str) -> list[PairRow]:
         pair_row = PairRow(
             raw_path=base / Path(r["raw_path"]),
             proc_path=base / Path(r["proc_path"]),
-            presence=bool(r["presence"]),
+            presence=float(r["presence"]),
             accumulation=int(r["accum"]) if opt else None,
             acquisition=float(r["acq_s"]) if opt else None,
         )
@@ -536,14 +582,15 @@ def read_pairs(csv_file: Path | str, base_dir: Path | str) -> list[PairRow]:
 # -- helper for converting raw text files to structured data
 
 
-def convert_raw_class(csv: str | Path, base: str | Path) -> None:
+def convert_raw_class(csv: str | Path, base: str | Path, raw: bool = True) -> None:
     """Save HSI maps to files in raw_path."""
     csv = Path(csv) if isinstance(csv, str) else csv
     base = Path(base) if isinstance(base, str) else base
+    raw_processed_path = "raw_path" if raw else "proc_path"
 
-    for map, df_row in read_class(csv_file=csv, base_dir=base):
+    for map, df_row in read_class(csv_file=csv, base_dir=base, raw=raw):
         READY_DATA_DIR.mkdir(exist_ok=True)
-        new_map_path = READY_DATA_DIR / Path(df_row["raw_path"]).name
+        new_map_path = READY_DATA_DIR / Path(df_row[raw_processed_path]).name
         try:
             save_outer(map, new_map_path)
         except IOError as e:
@@ -565,6 +612,7 @@ def build_classification(
     csv: str | Path | None = None,
     peak_cfg: PeakNormConfig | None = None,
     pre_config: PreConfig | None = None,
+    ref_wl: Arr1DF | None = None,
 ) -> ClassPair:
     """
     Build pair of data, labels and raw spectra.
@@ -572,6 +620,7 @@ def build_classification(
     Args:
         base: base directory containing training data.
         csv: optional path to csv file, used only for raw data
+        ref_wl: optional wavelength grid to resample all maps onto
 
     Returns:
         ClassPair object that contains the DataArtifacts and Spectra
@@ -597,16 +646,26 @@ def build_classification(
         "flats": [],
         "presences": [],
     }
+    ref_grid: Arr1DF | None = ref_wl
 
     for h in data:
-        presence, wl, hw = h.get_artifacts()
-        cube, stats = preprocess_cube(h.cube, wl, pre_config, peak_cfg)
-        flat = cube.flatten()
+        presence, wl, _hw = h.get_artifacts()
+        if ref_grid is None:
+            ref_grid = wl
+        if assert_same_grid(wl, ref_grid) is not None:
+            cube = h.cube.resample_cube(wl, ref_grid)
+            wl_use = ref_grid
+        else:
+            cube = h.cube
+            wl_use = wl
 
-        pre_arts["hw"].append(hw)
-        pre_arts["wls"].append(wl)
+        cube, stats = preprocess_cube(cube, wl_use, pre_config, peak_cfg)
+        arr = cube.flatten().get().astype(np.float64, copy=False)
+
+        pre_arts["hw"].append((cube.H, cube.W))
+        pre_arts["wls"].append(wl_use)
         pre_arts["presences"].append(presence)
-        pre_arts["flats"].append(flat.get())
+        pre_arts["flats"].append(arr)
         pre_arts["pre_stats"].append(stats)
 
     x_all: Arr2DF = np.vstack(pre_arts["flats"], dtype=np.float64)

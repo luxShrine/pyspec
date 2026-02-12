@@ -15,7 +15,8 @@ from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from pyspectral.config import REF_PHE
 from pyspectral.core import Cube, TruePredPair
 from pyspectral.result.compare import ClassicalPredict, FoldPlot, MLSVMPlot
-from pyspectral.result.predict import MaskedValues, PredictCubeData
+from pyspectral.result.predict import MaskedValues
+from pyspectral.result.spec_spec_ml import PredictCubeData
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
@@ -50,8 +51,13 @@ def _get_figure_size(number_plots: int) -> tuple[int, int]:
 # -- helper
 
 
-def build_loss_plot(loss_type: str | None = None):
+def build_loss_plot(
+    ax: Axes, *, loss_type: str | None = None, log_scale: bool = False
+) -> None:
     loss_type = f"({loss_type})" if loss_type is not None else ""
+    if log_scale:
+        plt.yscale("log")
+    ax.minorticks_on()
     plt.ylabel(f"Loss {loss_type}")
     plt.xlabel("Epochs (count)")
     plt.legend()
@@ -402,16 +408,17 @@ def cm_fpr_fnr(cm: np.ndarray[tuple[int, int]]) -> tuple[float, float]:
     # true true  cm[1][1]
     # false true cm[0][1]
     # false false cm[1][0]
-    total = cm.sum()
-    fpr = cm[0][1] / total
-    ffr = cm[1][0] / total
+    neg_total = cm[0].sum()
+    pos_total = cm[1].sum()
+    fpr = cm[0][1] / neg_total
+    ffr = cm[1][0] / pos_total
     return fpr, ffr
 
 
 def make_confusion_matrix(
     true_values: MaskedValues, pred_values: MaskedValues, threshold: UnitFloat
 ) -> np.ndarray[tuple[int, int]]:
-    true_pn = true_values.get_positive_negative_mask()  # label 2 → 1
+    true_pn = true_values.get_positive_negative_mask()
     pred_pn = pred_values.get_positive_negative_mask(threshold=float(threshold))
     return confusion_matrix(true_pn, pred_pn)
 
@@ -440,6 +447,8 @@ def plot_pixel_histogram(
     threshold: Numeric = 0.5,
     bins: int = 50,
     log_scale: bool = False,
+    *,
+    analysis_type: str | None = None,
 ) -> None:
     thresh_percent = UnitFloat(threshold)
     plt.hist(pos_pred, bins=bins, alpha=0.7, label="True pos pixels")
@@ -448,7 +457,10 @@ def plot_pixel_histogram(
     plt.axvline(thresh_percent, linestyle="--", label=f"threshold={thresh_percent}")
     plt.xlabel("Predicted positive probability")
     plt.ylabel("Pixel count")
-    plt.title("Predicted P(pos) by true class (0/1/2)")
+    t = "Predicted P(pos) by true class (0/0.5/1)"
+    if analysis_type is not None:
+        t += f" for {analysis_type}"
+    plt.title(t)
     plt.legend()
     plt.legend()
     plt.tight_layout()
@@ -489,11 +501,20 @@ def plot_pca_components(
     handles, label_vals = scatter.legend_elements()
     # the labels spit out latex symbols, so we must clean it out first
     label_vals = [
-        int(l.replace("$\\mathdefault{", "").replace("}$", "")) for l in label_vals
+        float(lbl.replace("$\\mathdefault{", "").replace("}$", ""))
+        for lbl in label_vals
     ]
 
-    name_map = {0: "negative", 1: "maybe", 2: "positive"}
-    names = [name_map[v] for v in label_vals]
+    names = []
+    for v in label_vals:
+        if np.isclose(v, 0.0):
+            names.append("negative")
+        elif np.isclose(v, 0.5):
+            names.append("maybe")
+        elif np.isclose(v, 1.0):
+            names.append("positive")
+        else:
+            names.append(f"class {v:g}")
 
     legend1 = ax.legend(handles, names, loc="upper right", title="Classes")
     ax.add_artist(legend1)
@@ -576,19 +597,26 @@ def do_MLSVM_plots(data: MLSVMPlot, threshold: float = 0.5) -> None:
     threshold = UnitFloat(threshold)
     # ML first
     ml = data.ml_cmp
-    plot_pixel_histogram(ml.pred.pos, ml.pred.neg, ml.pred.maybe, threshold=threshold)
+    plot_pixel_histogram(
+        ml.pred.pos, ml.pred.neg, ml.pred.maybe, threshold=threshold, analysis_type="ML"
+    )
 
     # PCA plots
     pca = data.pca_cmp
     plot_pixel_histogram(
-        pca.pred.pos, pca.pred.neg, pca.pred.maybe, threshold=threshold, bins=25
+        pca.pred.pos,
+        pca.pred.neg,
+        pca.pred.maybe,
+        threshold=threshold,
+        bins=25,
+        analysis_type="PCA+SVM",
     )
 
     # keep positive & negative
     svc = data.svc_preds[0]
     X_pca = svc.X
     y_full = svc.y
-    y_binary = (y_full == 2.0).astype(int)
+    y_binary = (np.isclose(y_full, 1.0) | np.isclose(y_full, 2.0)).astype(int)
 
     k: int = svc.k
     w: Arr1DF = svc.w

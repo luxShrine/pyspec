@@ -19,7 +19,6 @@ from pyspectral.types import (
     ArrayF32,
     MeanArray,
     StdArray,
-    UnitFloat,
 )
 
 # -- general helpers -------------------------------------------------------
@@ -150,22 +149,19 @@ class FoldStat:
 # -- pixel to class -------------------------------------------------------
 
 
-def convert_to_class(
-    pres: float, *, maybe_value: float | None = 0.5
-) -> UnitFloat | None:
-    """converts presence from ∈ {0,2} to ∈ {0,1}.
+def convert_to_class(pres: float, *, maybe_value: float | None = 0.5) -> float | None:
+    """Normalize a presence scalar to {0.0, 0.5, 1.0}.
 
     Args:
         maybe_value: float or None, if None, we drop the value.
     """
-    if pres == 0:
-        return UnitFloat(0.0)
-    elif pres == 2:
-        return UnitFloat(1.0)
-    else:
-        if maybe_value is None:
-            return maybe_value
-        return UnitFloat(maybe_value)
+    if np.isclose(pres, 0.0):
+        return 0.0
+    if np.isclose(pres, 1.0) or np.isclose(pres, 2.0):
+        return 1.0
+    if np.isclose(pres, 0.5):
+        return 0.5
+    return maybe_value
 
 
 def convert_arr_to_class(
@@ -175,7 +171,7 @@ def convert_arr_to_class(
     maybe_value: float | None = 0.5,
 ) -> np.ndarray[tuple[int]]:
     return np.asarray(
-        [convert_arr_to_class(i, maybe_value=maybe_value) for i in arr], dtype=dtype
+        [convert_to_class(i, maybe_value=maybe_value) for i in arr], dtype=dtype
     )
 
 
@@ -307,34 +303,34 @@ def _log_ratio_area(
 
 
 def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF) -> tuple[float, float]:
-    elements = roi.size
-    if elements == 0:
+    n = roi.size
+    if n == 0:
         return 0.0, 0.0
 
     i = int(np.nanargmax(roi))
     peak = float(roi[i])
-    if not np.isfinite(peak) or elements < 3 or peak <= 0:
+    if not np.isfinite(peak) or n < 3 or peak <= 0:
         return peak, 0.0
 
-    half_max = 0.5 * peak
-    # left crossing (<= hm) just before peak
-    left_idx = np.where(roi[:i] <= half_max)[0]
-    right_idx = np.where(roi[i:] <= half_max)[0]
+    half = 0.5 * peak
 
-    if left_idx.size == 0 and right_idx.size == 0:
+    # left crossing: last point <= half before peak
+    left = np.where(roi[:i] <= half)[0]
+    # right crossing: first point <= half after peak
+    right = np.where(roi[i:] <= half)[0]
+
+    if left.size == 0 or right.size == 0:
         return peak, 0.0
 
-    xl, xr = 0, 0
-    if left_idx.size != 0:
-        li = left_idx[-1]  # last index <= hm on the left
-        xl = np.interp(li, xp=roi, fp=wl_roi)
-    if right_idx.size != 0:
-        ri = i + right_idx[0]  # first index <= hm on the right
-        xr = np.interp(ri, xp=roi, fp=wl_roi)
+    li = int(left[-1])
+    li2 = min(li + 1, i)
+    xl = float(np.interp(half, [roi[li], roi[li2]], [wl_roi[li], wl_roi[li2]]))
 
-    width = float(abs(xr - xl))
-    # full width or half width
-    return peak, width
+    ri = int(i + right[0])
+    ri1 = max(ri - 1, i)
+    xr = float(np.interp(half, [roi[ri1], roi[ri]], [wl_roi[ri1], wl_roi[ri]]))
+
+    return peak, float(abs(xr - xl))
 
 
 @dataclass(frozen=True, slots=True)

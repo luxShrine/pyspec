@@ -32,13 +32,16 @@ type ModelOutput = nn.Module | Tensor | tuple | list
 
 def _get_pt_file(directory: Path = MODELS_DIR, fold_number: int = 0) -> Path:
     models = list(directory.glob("*.pt"))
-    options = len(models)
-    mod_list = filter(lambda x: str(fold_number) in x.as_posix(), models)
-    if options == 0:
+    mod_list = list(filter(lambda x: str(fold_number) in x.as_posix(), models))
+    if len(models) == 0:
         raise FileNotFoundError(f"No '.pt' files found in {MODELS_DIR}")
-    elif options == 1:
+    elif len(models) == 1:
         model = models[0]
-        logger.debug(f"Only one model found, loading model at: {model}")
+        logger.debug(f"Only one model found in folder, loading model at: {model}")
+        return model
+    elif len(mod_list) == 1:
+        model = mod_list[0]
+        logger.debug(f"Only one matching model found, loading model at: {model}")
         return model
     else:
         while True:

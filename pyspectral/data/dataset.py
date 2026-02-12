@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+import warnings
 from typing import override
 
 import numpy as np
@@ -84,6 +85,49 @@ class KFolds:
         G = ((h_bins[:, None] * tiles_w) + w_bins[None, :]).astype(np.int32)
         return G.ravel()
 
+    def _scene_splitter(
+        self, y_scene: np.ndarray[tuple[int], np.dtype[np.int64]]
+    ) -> tuple[CrossValidator, SplitIter]:
+        num_scenes = int(y_scene.shape[0])
+        if num_scenes < 2:
+            raise ValueError(
+                "Scene cross-validation requires at least 2 scenes; "
+                + f"got {num_scenes}."
+            )
+
+        n_splits = min(self.n_splits, num_scenes)
+        if n_splits != self.n_splits:
+            warnings.warn(
+                "Reducing scene CV fold count from "
+                + f"{self.n_splits} to {n_splits} due to limited scenes.",
+                stacklevel=2,
+            )
+
+        classes, counts = np.unique(y_scene, return_counts=True)
+        min_class_count = int(counts.min()) if counts.size else 0
+        can_stratify = classes.size > 1 and min_class_count >= 2
+
+        if can_stratify:
+            strat_splits = min(n_splits, min_class_count)
+            if strat_splits != n_splits:
+                warnings.warn(
+                    "Reducing scene CV fold count from "
+                    + f"{n_splits} to {strat_splits} to satisfy class balance.",
+                    stacklevel=2,
+                )
+            skf = StratifiedKFold(
+                n_splits=strat_splits, shuffle=True, random_state=self.random_state
+            )
+            return skf, skf.split(np.zeros(num_scenes), y_scene)
+
+        warnings.warn(
+            "Falling back to non-stratified KFold for scene CV; "
+            + f"class counts are {counts.tolist()}.",
+            stacklevel=2,
+        )
+        kfold = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
+        return kfold, kfold.split(np.zeros(num_scenes))
+
     def get_splits(
         self,
         hw: tuple[int, int] | None = None,
@@ -117,12 +161,11 @@ class KFolds:
     def scene_splits(
         self, arts: DataArtifacts
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
-        y_scene = np.asarray(arts.presences, dtype=int)  # (S,)
-        num_scenes = len(arts.scene_ids)
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
-        )
-        for tr_s, va_s in skf.split(np.zeros(num_scenes), y_scene):
+        y_scene = np.asarray(
+            [int(float(p.mean) >= 0.75) for p in arts.presences], dtype=np.int64
+        )  # (S,)
+        _, split_iter = self._scene_splitter(y_scene)
+        for tr_s, va_s in split_iter:
             yield tr_s.astype(np.int64), va_s.astype(np.int64)
 
     def scene_cv_pixel_indices(
@@ -133,11 +176,8 @@ class KFolds:
         # has any presences
         strat = [int(p.map.mean() > 0.5) for p in arts.presences]
         y_scene = np.asarray(strat, dtype=np.int64)  # shape (Scenes,)
-        num_scenes = len(arts.scene_ids)
-        skf = StratifiedKFold(
-            n_splits=self.n_splits, shuffle=True, random_state=self.random_state
-        )
-        for tr_s, va_s in skf.split(np.zeros(num_scenes), y_scene):
+        _, split_iter = self._scene_splitter(y_scene)
+        for tr_s, va_s in split_iter:
             tr_idx: np.ndarray[tuple[int], np.dtype[np.int64]] = np.concatenate(
                 [
                     np.arange(sl.start, sl.stop)
@@ -179,7 +219,11 @@ class SpecSpecDataset(Dataset[SpectralData]):
 
 
 def build_spec_datasets(
-    n_splits: int, data: SpectraPair
+    n_splits: int,
+    data: SpectraPair,
+    *,
+    arts: DataArtifacts | None = None,
+    pixels_per_tile: int | None = None,
 ) -> Generator[
     tuple[
         tuple[SpecSpecDataset, np.ndarray],
@@ -193,12 +237,33 @@ def build_spec_datasets(
     raw = data.X_raw.astype(np.float32)  # (N,C)
     prc = data.Y_proc.astype(np.float32)  # (N,C)
 
-    # TODO: calculate this instead of magic
-    h = w = 8
-    ppt = int(h / 2)
+    if arts is None:
+        kfolds = KFolds(n_splits, raw)
+        _cv, split_iter = kfolds.get_splits()
+    else:
+        groups_list = []
+        group_offset = 0
+        for H, W in arts.hw:
+            g = KFolds._make_grid_groups(
+                int(H),
+                int(W),
+                tiles_h=None,
+                tiles_w=None,
+                pixels_per_tile=pixels_per_tile,
+            )
+            g = g + group_offset
+            groups_list.append(g)
+            group_offset += int(g.max()) + 1
 
-    kfolds = KFolds(n_splits, raw)
-    _cv, split_iter = kfolds.get_splits((h, w), pixels_per_tile=ppt)
+        groups = np.concatenate(groups_list).astype(np.int32)
+        if groups.shape[0] != raw.shape[0]:
+            raise RuntimeError(
+                "Group/pixel mismatch: groups length "
+                + f"{groups.shape[0]} != data length {raw.shape[0]}"
+            )
+
+        kfold = GroupKFold(n_splits=n_splits)
+        split_iter = kfold.split(raw, groups=groups)
 
     for tr_s, te_s in split_iter:
         # take out the sections of the arrays by index & normalize around average
@@ -219,7 +284,7 @@ type ClassSpectralData = tuple[torch.Tensor, torch.Tensor, int]
 class PixelSpectraDataset(Dataset[ClassSpectralData]):
     """
     X_i: (D,)               float32, pixel features for pixel i
-    y_i: ()                 float32 scalar {0,1,2}
+    y_i: ()                 float32 scalar {0,0.5,1}
     pixel_ids (M,):         indicies into feats
     scene_of_pixel (N,):    maps global pixel -> scene_idx
 
@@ -254,14 +319,15 @@ class PixelSpectraDataset(Dataset[ClassSpectralData]):
         slice = self.arts.slices[scene_index]
         local_index = pixel - slice.start
 
-        pixel_presence = self.arts.presences[scene_index].map.flatten()[local_index]
-        # NOTE: converts presence from ∈ {0,2} to ∈ {0,1}
-        if pixel_presence == 0:
-            pixel_presence = 0.0
-        elif pixel_presence == 2:
-            pixel_presence = 1.0
-        else:
-            pixel_presence = 0.5  # maybe
+        pixel_presence = float(
+            self.arts.presences[scene_index].map.flatten()[local_index]
+        )
+        if not (
+            np.isclose(pixel_presence, 0.0)
+            or np.isclose(pixel_presence, 0.5)
+            or np.isclose(pixel_presence, 1.0)
+        ):
+            raise ValueError(f"Unsupported pixel presence value: {pixel_presence}")
 
         X = torch.from_numpy(self.feats[pixel]).float().contiguous()
         y = torch.tensor(pixel_presence, dtype=torch.float32)
@@ -296,7 +362,7 @@ class SceneSpectralDataset(Dataset[ClassSpectralData]):
     """
     getitem[i] -> (X_i, y_i, scene_idx)
     X_i : (T_i, D) float32, all pixel features for scene i
-    y_i : ()        float32 scalar {0,1}
+    y_i : ()        float32 scalar {0,0.5,1}
     scene_idx : int index into arts.scene_ids
     """
 

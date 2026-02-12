@@ -48,7 +48,7 @@ def test_loading_hsi_map():
 def test_spectral_pair():
     from sklearn.model_selection import KFold
 
-    import pyspectral.result.predict as predict
+    import pyspectral.result.spec_spec_trad as predict
 
     pair = pdi.SpectraPair(
         spectra.get().astype(np.float64), spectra_gt.get().astype(np.float64)

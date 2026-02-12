@@ -7,7 +7,7 @@ import pyspectral.result.plots as plot
 
 
 @pytest.mark.slow
-def test_plot_boundary():
+def test_plot_boundary() -> None:
     NUM_CENTER: float = 1654.0  # example Raman peak
     DEN_CENTER: float = 1446.0
     HALFWIDTH: float = 12.0
