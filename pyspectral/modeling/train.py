@@ -241,7 +241,7 @@ def run_epochs(
     best_vl_loss, best_preds, fi, tr_loss, vl_loss = float("inf"), None, 0.0, [], []
     model = train_setup.model
     loss_fn = train_setup.loss_fn
-    best_state: dict | None = None
+    best_state: dict[Any, Any] | None = None
 
     for _ep in tqdm(range(1, epochs + 1), desc="Running Epochs..."):
         tr_loss.append(
@@ -311,7 +311,7 @@ def cv_train_model(
     oof_stats = oof.Stats(prc_spectra=spectral_pairs.Y_proc, artifacts=arts)
 
     for fold, ((train_ds, _), (test_ds, te_idx), fold_stat) in enumerate(
-        build_spec_datasets(n_splits, spectral_pairs)
+        build_spec_datasets(n_splits, spectral_pairs, arts=arts)
     ):
         train_dl, test_dl = create_dataloader(
             train_ds, test_ds, device, batch_size=batch_size
