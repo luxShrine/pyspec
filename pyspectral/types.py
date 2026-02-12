@@ -61,6 +61,32 @@ class UnitFloat(float):
         return super().__new__(cls, value)
 
 
+class SameFirstDimensionArrays:
+    def __init__(self, array_1: np.ndarray, array_2: np.ndarray):
+        if not (array_1.shape[0] == array_2.shape[0]):
+            raise ValueError(
+                f"SameFirstDimensionArrays must hold the same first dimension shape: {array_1.shape=}, {array_2.shape=}."
+            )
+        self.arr_1: np.ndarray = array_1
+        self.arr_2: np.ndarray = array_2
+
+    def tup(self) -> tuple[np.ndarray, np.ndarray]:
+        return (self.arr_1, self.arr_2)
+
+
+class SameDimensionArrays:
+    def __init__(self, array_1: np.ndarray, array_2: np.ndarray):
+        if not (array_1.shape == array_2.shape):
+            raise ValueError(
+                f"SameFirstDimensionArrays must hold the same shapes: {array_1.shape=}, {array_2.shape=}."
+            )
+        self.arr_1: np.ndarray = array_1
+        self.arr_2: np.ndarray = array_2
+
+    def tup(self) -> tuple[np.ndarray, np.ndarray]:
+        return (self.arr_1, self.arr_2)
+
+
 # -- physics/processing types -------------------------------------------------------
 
 
