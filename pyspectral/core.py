@@ -39,22 +39,15 @@ def set_presence_map_encoding(presence_map: np.ndarray):
 
     Supported inputs:
     - Normalized: {0.0, 0.5, 1.0}
-    - Legacy ternary: {0, 1, 2} where 1=maybe and 2=positive
     - Binary: {0, 1} where 1=positive
     """
     raw = np.asarray(presence_map, dtype=np.float64)
     if np.isnan(raw).any():
         raise ValueError("Presence map cannot contain NaN values.")
-    if (raw < 0).any() or (raw > 2).any():
-        raise ValueError("Presence map values must be in [0, 2].")
+    if (raw < 0).any() or (raw > 1).any():
+        raise ValueError("Presence map values must be in [0, 1].")
 
-    uses_legacy_ternary = np.isclose(raw, 2.0).any()
-    if uses_legacy_ternary:
-        # Legacy encoding is ambiguous at value=1.0, so remap with original values.
-        normalized = np.where(np.isclose(raw, 2.0), 1.0, raw)
-        normalized = np.where(np.isclose(raw, 1.0), 0.5, normalized)
-    else:
-        normalized = raw
+    normalized = raw
 
     valid = (
         np.isclose(normalized, 0.0)
@@ -67,16 +60,9 @@ def set_presence_map_encoding(presence_map: np.ndarray):
     return normalized
 
 
-def _label_to_class_name(
-    label: float, *, legacy_ternary: bool
-) -> Literal["negatives", "maybe", "samples"]:
+def _label_to_class_name(label: float) -> Literal["negatives", "maybe", "samples"]:
     if np.isclose(label, 0.0):
         return "negatives"
-    if legacy_ternary:
-        if np.isclose(label, 1.0):
-            return "maybe"
-        if np.isclose(label, 2.0):
-            return "samples"
     else:
         if np.isclose(label, 0.5):
             return "maybe"
@@ -215,8 +201,7 @@ class Cube:
         """Flatten cube per class.
 
         Args:
-            labels: 2D array (H, W) with either legacy {0,1,2}
-                or normalized {0,0.5,1} labels.
+            labels: 2D array (H, W) with normalized {0,0.5,1} labels.
         """
         H, W, _ = self.shape
         if (c := labels.shape) != (H, W):
@@ -227,12 +212,11 @@ class Cube:
         # Flatten spatial dims
         flat = self.flatten()
         flat_labels = labels.reshape(-1).astype(np.float64, copy=False)  # (H*W,)
-        legacy_ternary = np.isclose(flat_labels, 2.0).any()
 
         spectra_by_class: SpectraByClass = {"negatives": [], "maybe": [], "samples": []}
 
         for spec, lab in zip(iter(flat), flat_labels):
-            class_name = _label_to_class_name(float(lab), legacy_ternary=legacy_ternary)
+            class_name = _label_to_class_name(float(lab))
             spectra_by_class[class_name].append(spec)
 
         return spectra_by_class
