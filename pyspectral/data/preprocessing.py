@@ -21,6 +21,10 @@ from pyspectral.types import (
 )
 
 type BaselineMethod = BaselinePolynomialDegree | ALS | None
+type PeakNormMode = GuidedPeakNorm | NonePeakNorm | FixedPeakNorm | GlobalPeakNorm
+type NormResult = tuple[
+    ArrayF, PreprocStats | None, int | float | None, int | float | None
+]
 DEFAULT_BASE_POLY = BaselinePolynomialDegree(2)
 
 
@@ -400,9 +404,6 @@ class FixedPeakNorm:
     mode_type: str = "Fixed"
 
 
-type PeakNormMode = GuidedPeakNorm | NonePeakNorm | FixedPeakNorm | GlobalPeakNorm
-
-
 @dataclass(frozen=True)
 class PreprocStats:
     ref_center_cm1: float | None = None
@@ -413,11 +414,6 @@ class PreprocStats:
             raise RuntimeError("Cannot get center of preprocess stats as it is none")
         else:
             return self.ref_center_cm1
-
-
-type NormResult = tuple[
-    ArrayF, PreprocStats | None, int | float | None, int | float | None
-]
 
 
 @dataclass(frozen=True)

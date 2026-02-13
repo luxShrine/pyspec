@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import copy
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 import numpy as np
@@ -16,21 +17,80 @@ from pyspectral.core import TestResult
 from pyspectral.data.dataset import (
     build_pix_scene_datasets,
     build_scene_datasets,
-    build_spec_datasets,
-    pixel_collate,
-    scene_collate,
 )
 from pyspectral.data.features import RegionSet
-from pyspectral.data.io import ClassPair, DataArtifacts, SpectraPair
+from pyspectral.data.io import ClassPair
+from pyspectral.data.shared import ClassSpectralData
 import pyspectral.modeling.models as pm
 import pyspectral.modeling.oof as oof
 from pyspectral.types import (
     ArrayF32,
     ClassModelType,
-    SpecModelType,
 )
 
 # -- helpers -------------------------------------------------------
+
+
+def scene_collate(
+    batch: list[ClassSpectralData],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad each differently sized batch to largest batch size.
+
+    Args:
+        batch: list[tuple[torch.Tensor, torch.Tensor, int]] of length (B,) each
+        with shape of (T_i*D, 1, scene_index)
+        - T_i:         the ith feature tensor
+        - D:           dimensionality of features
+        - scene_index: the corresponding int id of the scene
+
+
+    Returns:
+        padded_features: Features padded to shape of (B, T, D)
+        mask:
+        y:
+        scene_idx:
+    """
+    # batch: list of (X, y, scene_idx): b[0].shape[0] = X.shape[0] = T_i*D
+    lengths = [b[0].shape[0] for b in batch]
+    D = batch[0][0].shape[1]
+    B = len(batch)
+    T = max(lengths)
+
+    padded_features = batch[0][0].new_zeros((B, T, D))  # padded features
+    mask = torch.zeros((B, T), dtype=torch.bool)
+    y = torch.stack([b[1] for b in batch], dim=0)  # (B,)
+    scene_idx = torch.tensor([b[2] for b in batch], dtype=torch.long)
+
+    for i, (xi, _, _) in enumerate(batch):
+        t = xi.shape[0]
+        padded_features[i, :t] = xi
+        mask[i, :t] = True  # True for valid positions
+
+    return padded_features, mask, y, scene_idx
+
+
+def pixel_collate(
+    batch: list[ClassSpectralData],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Collate function for pixel-level spectral datasets.
+
+    Args:
+        batch: List of (features, target, scene_idx) tuples where features
+            have shape (D,).
+
+    Returns:
+        feats: Tensor of shape (B, 1, D) suitable for MIL models.
+        mask: Boolean tensor of shape (B, 1) marking valid positions.
+        y: Tensor of shape (B,) with presence targets.
+        scene_idx: Tensor of shape (B,) with scene indices.
+    """
+    feats = torch.stack([b[0] for b in batch], dim=0)  # (B, D)
+    feats = feats.unsqueeze(1)  # (B, 1, D)
+    y = torch.stack([b[1] for b in batch], dim=0)  # (B,)
+    scene_idx = torch.tensor([b[2] for b in batch], dtype=torch.long)
+    mask = torch.ones((feats.shape[0], feats.shape[1]), dtype=torch.bool)
+    return feats, mask, y, scene_idx
 
 
 def pick_device() -> torch.device:
@@ -138,11 +198,10 @@ def pred_to_numpy(pred: Tensor) -> ArrayF32:
 
 def train_epoch(
     dataloader: DataLoader,
-    model: pm.Model,
+    model: pm.ClassMapper,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    penalty: pm.Penalty,
 ) -> float:
     """Run a single training epoch and return the average batch loss.
 
@@ -168,7 +227,6 @@ def train_epoch(
             target = target.long()
 
         batch_loss = loss_fn(pred, target)
-        batch_loss = penalty.apply_penalty(model, batch_loss)
 
         # backpropagation
         batch_loss.backward()
@@ -182,7 +240,7 @@ def train_epoch(
 @torch.no_grad()
 def test_epoch(
     loader: DataLoader,
-    model: pm.Model,
+    model: pm.ClassMapper,
     loss_fn: nn.Module,
     device: torch.device,
 ) -> TestResult:
@@ -251,7 +309,6 @@ def run_epochs(
                 loss_fn,
                 train_setup.optimizer,
                 device,
-                train_setup.penalty,
             )
         )
 
@@ -269,85 +326,6 @@ def run_epochs(
     if return_best_state:
         return fold_loss, best_preds, best_state
     return fold_loss, best_preds, None
-
-
-def cv_train_model(
-    spectral_pairs: SpectraPair,
-    arts: DataArtifacts,
-    n_splits: int = 4,
-    batch_size: int = 2,
-    epochs: int = 20,
-    lr: float = 2e-4,
-    wd: float = 1e-4,
-    model_type: str | SpecModelType = SpecModelType.LRSM,
-    rank: int = 8,
-    band_penalty: pm.BandPenalty | None = None,
-    verbose: bool = False,
-) -> oof.Stats:
-    """Train the mapper with cross-validation and accumulate out-of-fold diagnostics.
-
-    Args:
-        n_splits: Number of cross-validation folds to construct.
-        batch_size: Mini-batch size fed to the training loop.
-        epochs: Number of training epochs per fold.
-        lr: Learning rate supplied to the optimizer factory.
-        wd: Weight decay applied when using AdamW.
-        model_type: Name of the spectral mapper variant to train.
-        rank: Rank parameter for low-rank spectral mappers.
-        verbose: Whether to stream fold-level diagnostics to stdout.
-
-    Returns:
-        Aggregated out-of-fold statistics capturing losses and predictions.
-    """
-    band_penalty = pm.BandPenalty() if band_penalty is None else band_penalty
-    device = pick_device()
-    model_type = (
-        model_type
-        if isinstance(model_type, SpecModelType)
-        else SpecModelType(model_type)
-    )
-
-    # out of fold metrics container
-    oof_stats = oof.Stats(prc_spectra=spectral_pairs.Y_proc, artifacts=arts)
-
-    for fold, ((train_ds, _), (test_ds, te_idx), fold_stat) in enumerate(
-        build_spec_datasets(n_splits, spectral_pairs, arts=arts)
-    ):
-        train_dl, test_dl = create_dataloader(
-            train_ds, test_ds, device, batch_size=batch_size
-        )
-        c_in = train_ds[0][0].shape[0]
-        _c_out = train_ds[0][1].shape[0]
-
-        # setup model
-        cfg = pm.SpectraCfg(fold_stat, model_type, band_penalty=band_penalty, rank=rank)
-        train_setup = pm.TrainSetup.get_train_setup(
-            c_in, device, lr=lr, wd=wd, goal=cfg
-        )
-
-        train_setup.log_init(fold)
-
-        fold_loss, best_preds, _ = run_epochs(
-            epochs,
-            train_dl,
-            test_dl,
-            train_setup,
-            device,
-        )
-
-        if verbose:
-            out = f"Fold {fold + 1}/{n_splits} |" + fold_loss.repr()
-            tqdm.write(out)
-
-        # store metrics
-        oof_stats.store(
-            fold_stat,
-            best_preds,
-            te_idx,
-            fold_loss,
-        )
-
-    return oof_stats
 
 
 def train_class(

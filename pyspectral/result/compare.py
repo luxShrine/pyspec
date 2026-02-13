@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
 import json
 from pathlib import Path
 from typing import Any
@@ -9,9 +8,6 @@ from typing import Any
 from loguru import logger
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.metrics import (
-    root_mean_squared_error,
-)
 from sklearn.model_selection import cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -22,48 +18,155 @@ from pyspectral.core import FlatMap
 from pyspectral.data.dataset import KFolds
 import pyspectral.data.io as io
 import pyspectral.data.preprocessing as prep
-from pyspectral.modeling.models import BandPenalty
 import pyspectral.modeling.oof as oof
 from pyspectral.modeling.train import (
     compute_iou_from_masks,
-    cv_train_model,
     train_pixel,
 )
-from pyspectral.result.predict import (
-    MaskedValues,
-    PredCompare,
-)
-from pyspectral.result.spec_class_ml import (
+from pyspectral.result.class_ml import (
     SVCPred,
     create_svm_pipeline,
     ml_class_predict_pixel,
 )
-from pyspectral.result.spec_class_trad import svm_class_predict_pixel
-from pyspectral.result.spec_spec_trad import multitask_elasticnet_predict, pcr_predict
+from pyspectral.result.class_trad import svm_class_predict_pixel
+from pyspectral.result.predict import (
+    MaskedValues,
+    PredCompare,
+)
 from pyspectral.types import (
     Arr2DF,
     ArrayF,
-    BaselinePolynomialDegree,
     SameDimensionArrays,
     SameFirstDimensionArrays,
-    SpecModelType,
     UnitFloat,
 )
 
-# -- General Compare -------------------------------------------------------
+# -- types
+
+type LossCompare = tuple[list[FoldPlot], ClassicalPredict]
+
+# -- check polarity
 
 
-def confusion_at_threshold(
-    true: np.ndarray, pred: np.ndarray, threshold: float = 0.5
-) -> dict[str, int]:
-    y_hat = (pred >= threshold).astype(np.float32)
+def _positive_presence_mask(
+    labels: np.ndarray,
+) -> np.ndarray[tuple[int], np.dtype[np.bool_]]:
+    flat = np.asarray(labels).reshape(-1)
+    mask = np.isclose(flat, 1.0) | np.isclose(flat, 2.0)
+    return np.asarray(mask, dtype=np.bool_)
 
-    tp = np.sum((true == 1.0) & (y_hat == 1.0))
-    fp = np.sum((true == 0.0) & (y_hat == 1.0))
-    tn = np.sum((true == 0.0) & (y_hat == 0.0))
-    fn = np.sum((true == 1.0) & (y_hat == 0.0))
 
-    return dict(tp=int(tp), fp=int(fp), tn=int(tn), fn=int(fn))
+def _flatten_positive_probability(
+    probs: np.ndarray,
+):
+    arr = np.asarray(probs, dtype=np.float32)
+    if arr.ndim == 2:
+        if arr.shape[1] < 2:
+            raise ValueError(
+                "Expected probability matrix with at least two columns; "
+                + f"got shape {arr.shape}."
+            )
+        return np.asarray(arr[:, 1], dtype=np.float32)
+    return np.asarray(arr.reshape(-1), dtype=np.float32)
+
+
+def _check_prediction_polarity(
+    name: str,
+    true_labels: np.ndarray,
+    pred_prob: np.ndarray,
+    threshold: UnitFloat,
+    *,
+    strict: bool = False,
+) -> bool:
+    true_pos = _positive_presence_mask(true_labels)
+    probs = _flatten_positive_probability(pred_prob)
+    if true_pos.shape[0] != probs.shape[0]:
+        raise ValueError(
+            f"Cannot compare {name} polarity; "
+            + f"label count {true_pos.shape[0]} != probability count {probs.shape[0]}."
+        )
+
+    pos_count = int(true_pos.sum())
+    neg_count = int((~true_pos).sum())
+    if pos_count == 0 or neg_count == 0:
+        logger.warning(
+            "Skipping polarity check for {} due to missing classes "
+            + "(pos_count={}, neg_count={}).",
+            name,
+            pos_count,
+            neg_count,
+        )
+        return False
+
+    pos_mean = float(np.mean(probs[true_pos]))
+    neg_mean = float(np.mean(probs[~true_pos]))
+    pred_pos = probs >= float(threshold)
+    acc = float(np.mean(pred_pos == true_pos))
+    acc_flipped = float(np.mean((~pred_pos) == true_pos))
+
+    appears_flipped = (pos_mean < neg_mean) or (acc_flipped > (acc + 0.05))
+    if appears_flipped:
+        msg = (
+            f"Potential polarity inversion in {name}: "
+            + f"mean_pos={pos_mean:.4f}, mean_neg={neg_mean:.4f}, "
+            + f"acc@{float(threshold):.2f}={acc:.4f}, "
+            + f"acc_if_flipped={acc_flipped:.4f}."
+        )
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+    else:
+        logger.debug(
+            "{} polarity check passed: mean_pos={:.4f}, mean_neg={:.4f}, "
+            + "acc@{:.2f}={:.4f}.",
+            name,
+            pos_mean,
+            neg_mean,
+            float(threshold),
+            acc,
+        )
+    return appears_flipped
+
+
+def _warn_if_models_anticorrelate(
+    first_name: str,
+    first_prob: np.ndarray,
+    second_name: str,
+    second_prob: np.ndarray,
+) -> None:
+    p_first = _flatten_positive_probability(first_prob)
+    p_second = _flatten_positive_probability(second_prob)
+    if p_first.shape[0] != p_second.shape[0]:
+        logger.warning(
+            "Skipping model-to-model polarity check: {} count {} != {} count {}.",
+            first_name,
+            p_first.shape[0],
+            second_name,
+            p_second.shape[0],
+        )
+        return
+    if np.isclose(float(np.std(p_first)), 0.0) or np.isclose(
+        float(np.std(p_second)), 0.0
+    ):
+        logger.warning(
+            "Skipping model-to-model polarity check: near-constant probabilities "
+            + "for {} or {}.",
+            first_name,
+            second_name,
+        )
+        return
+
+    corr = float(np.corrcoef(p_first, p_second)[0, 1])
+    corr_flipped = float(np.corrcoef(1.0 - p_first, p_second)[0, 1])
+    if corr_flipped > (corr + 0.2):
+        logger.warning(
+            "{} and {} appear anti-correlated "
+            + "(corr={:.4f}, corr_if_first_flipped={:.4f}).",
+            first_name,
+            second_name,
+            corr,
+            corr_flipped,
+        )
 
 
 # -- Compare pre-processing -------------------------------------------------------
@@ -74,92 +177,10 @@ class ClassicalPredict:
 
 
 class FoldPlot:
-    def __init__(self, oof_stats: oof.Stats, label: str) -> None:
-        all_loss = oof_stats.get_loss()
-        self.train_loss: ArrayF = all_loss.loss.train
-        self.test_loss: ArrayF = all_loss.loss.test
+    def __init__(self, train_loss: ArrayF, test_loss: ArrayF, label: str) -> None:
+        self.train_loss: ArrayF = train_loss
+        self.test_loss: ArrayF = test_loss
         self.label: str = label
-
-
-type LossCompare = tuple[list[FoldPlot], ClassicalPredict]
-
-
-def compare_models(csv: Path, data: Path, epochs: int = 10) -> LossCompare:
-    """Spec to Spec Pre-processing determiner."""
-    # compare across epochs, ranks, complexity
-    normal_off_diag = 1e-5
-    normal_bias = 1e-2
-
-    ranks = [12, 64]
-    lrs = [2e-4]
-    lam_ids = [0.0, 1e-2]
-    off_diag = [0.0, normal_off_diag]
-    bands = [1]
-    biases = [0.0, 1e-4, normal_bias]
-    n_splits = [4]
-    pre_processing = [
-        prep.PreConfig(
-            smoothing=None,
-            spike_kernel_size=1,
-            baseline=BaselinePolynomialDegree(1),
-        ),
-        prep.PreConfig(smoothing=None, baseline=BaselinePolynomialDegree(2)),
-        prep.PreConfig(
-            smoothing=prep.SmoothCfg(), baseline=BaselinePolynomialDegree(2)
-        ),
-    ]
-    models = [SpecModelType.LRSM, SpecModelType.LSM]
-    # prevent training with different penalties that won't apply to respective types
-    lrsm_mp = list(product([models[0]], lam_ids, off_diag, [bands[0]], [biases[0]]))
-    lsm_mp = list(product([models[1]], [lam_ids[0]], [off_diag[0]], bands, biases))
-    model_penalties = lrsm_mp + lsm_mp
-
-    peak_config = prep.PeakNormConfig(mode=prep.GlobalPeakNorm())
-
-    loss_plot_data = []
-    permutations = list(product(ranks, lrs, n_splits, model_penalties, pre_processing))
-    logger.debug(f"Number of configs comparing: {len(permutations)}")
-    rows = io.read_pairs(csv, data)
-    # iterate across each rank, and then CNN then against classical method
-    for r, lr, n, mp, pre in permutations:
-        mt, li, od, ba, bi = mp
-        train_settings = f"{r=}|{lr=}|{li=}|{od=}|{ba=}|{bi=}|{n=}|{pre}|{mt}"
-        print(train_settings)
-        spectra, arts = io.SpectraPair.from_annotations(
-            rows, peak_cfg=peak_config, pre_config=pre
-        )
-
-        band_penalty = BandPenalty(id=li, off_diag=od, band=ba, bias=bi)
-
-        oof_stats = cv_train_model(
-            spectral_pairs=spectra,
-            arts=arts,
-            epochs=epochs,
-            band_penalty=band_penalty,
-            lr=lr,
-            n_splits=n,
-            model_type=mt,
-            rank=r,
-        )
-        loss_plot_data.append(FoldPlot(oof_stats, train_settings))
-
-        print(20 * "-")
-
-    # PCR/ElasticNet comparison
-    classical, _ = io.SpectraPair.from_annotations(rows)
-    true = classical.Y_proc
-    cv, _split_iter = KFolds(
-        n_splits=n_splits[0], raw_data=classical.X_raw
-    ).get_splits()
-    enet = multitask_elasticnet_predict(classical.X_raw, classical.Y_proc, cv)
-    pcr = pcr_predict(classical.X_raw, classical.Y_proc, cv=cv)
-    enet_rmse = root_mean_squared_error(true, enet)
-    pcr_rmse = root_mean_squared_error(true, pcr)
-
-    return loss_plot_data, ClassicalPredict(pcr_rmse, enet_rmse)
-
-
-# -- Compare Spec to Class -------------------------------------------------------
 
 
 @dataclass
@@ -219,6 +240,8 @@ def _do_ml_train(
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
+    *,
+    strict_polarity: bool = False,
 ) -> tuple[PredCompare, oof.EpochLosses, np.ndarray[tuple[int], np.dtype[np.float32]]]:
     oof_stats = train_pixel(
         class_pair,
@@ -237,7 +260,10 @@ def _do_ml_train(
     # ml_cm = _make_confusion_matrix(ml_true_masked, ml_pred_masked, threshold)
 
     ml_probs = pred.flatten()
-    baseline = np.isclose(true_flat, 1.0) | np.isclose(true_flat, 2.0)
+    _check_prediction_polarity(
+        "ML OOF", true_flat, ml_probs, threshold, strict=strict_polarity
+    )
+    baseline = _positive_presence_mask(true_flat)
     ml_mask = ml_probs >= threshold
     ml_iou = compute_iou_from_masks(baseline, ml_mask)
     ml_cmp = PredCompare(
@@ -339,6 +365,8 @@ def _do_pca_svm_predict(
     threshold: UnitFloat,
     N_SPLITS: int,
     RANDOM_STATE: int,
+    *,
+    strict_polarity: bool = False,
 ) -> tuple[PredCompare, list[SVCPred]]:
     y_binary, presence_maps = _get_binary_map(arts).tup()
     unique_labels = np.unique(y_binary)
@@ -375,16 +403,17 @@ def _do_pca_svm_predict(
         pipeline.fit(X_pix, y_binary)
         svc_prob = np.asarray(pipeline.predict_proba(X_pix))
 
-    svc_pos_probs = np.asarray(svc_prob[:, 1], dtype=np.float32)
+    svc_pos_probs = _flatten_positive_probability(svc_prob)
+    _check_prediction_polarity(
+        "SVM OOF", true_flat, svc_pos_probs, threshold, strict=strict_polarity
+    )
 
     # masks from true labels
     svc_true_masked = MaskedValues.build(true_flat, true_flat)
     svc_pred_masked = MaskedValues.build(svc_pos_probs, true_flat)
 
     svc_mask = svc_pos_probs >= float(threshold)
-    svc_iou = compute_iou_from_masks(
-        np.isclose(true_flat, 1.0) | np.isclose(true_flat, 2.0), svc_mask
-    )
+    svc_iou = compute_iou_from_masks(_positive_presence_mask(true_flat), svc_mask)
 
     pca_cmp = PredCompare(
         true=svc_true_masked, pred=svc_pred_masked, iou=svc_iou, pred_prob=svc_prob
@@ -405,7 +434,13 @@ def _do_pca_svm_predict(
     return pca_cmp, [svc_pred]
 
 
-def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> MLSVMPlot:
+def class_ml_svm(
+    epochs: int = 10,
+    *,
+    threshold: float = 0.5,
+    k: int = 10,
+    strict_polarity: bool = False,
+) -> MLSVMPlot:
     N_SPLITS: int = 4
     RANDOM_STATE: int = 47
     threshold = UnitFloat(threshold)
@@ -416,13 +451,28 @@ def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> ML
     # -- ML -------------------------------------------------------
 
     ml_cmp, ml_loss, true_flat = _do_ml_train(
-        class_pair, epochs, threshold, N_SPLITS, RANDOM_STATE
+        class_pair,
+        epochs,
+        threshold,
+        N_SPLITS,
+        RANDOM_STATE,
+        strict_polarity=strict_polarity,
     )
 
     # -- PCA -------------------------------------------------------
 
     pca_cmp, svc_preds = _do_pca_svm_predict(
-        X_pix, arts, k, true_flat, threshold, N_SPLITS, RANDOM_STATE
+        X_pix,
+        arts,
+        k,
+        true_flat,
+        threshold,
+        N_SPLITS,
+        RANDOM_STATE,
+        strict_polarity=strict_polarity,
+    )
+    _warn_if_models_anticorrelate(
+        "ML OOF", ml_cmp.pred_prob, "SVM OOF", pca_cmp.pred_prob
     )
 
     return MLSVMPlot(
@@ -431,7 +481,7 @@ def class_ml_svm(epochs: int = 10, *, threshold: float = 0.5, k: int = 10) -> ML
 
 
 def class_pixel(
-    path_to_map: Path, *, threshold: float = 0.9
+    path_to_map: Path, *, threshold: float = 0.9, strict_polarity: bool = False
 ) -> tuple[PredCompare, PredCompare]:
     threshold = UnitFloat(threshold)
     hsi_map = io.HSIMap.from_processed(path_to_map)
@@ -445,6 +495,14 @@ def class_pixel(
     flat = cube.flatten()
 
     ml_prediction = ml_class_predict_pixel(flat, wl, presence, threshold=threshold)
+    true_flat = np.asarray(presence.map.flatten(), dtype=np.float32)
+    _check_prediction_polarity(
+        "ML single-map",
+        true_flat,
+        ml_prediction.pred_prob,
+        threshold,
+        strict=strict_polarity,
+    )
 
     # fit pipeline on all data
     class_pair = io.build_classification(
@@ -468,5 +526,18 @@ def class_pixel(
     # predict on the particular pixels from the map
     svc_prediction = svm_class_predict_pixel(
         aligned_flat, presence, pipeline, threshold=threshold
+    )
+    _check_prediction_polarity(
+        "SVM single-map",
+        true_flat,
+        svc_prediction.pred_prob,
+        threshold,
+        strict=strict_polarity,
+    )
+    _warn_if_models_anticorrelate(
+        "ML single-map",
+        ml_prediction.pred_prob,
+        "SVM single-map",
+        svc_prediction.pred_prob,
     )
     return ml_prediction, svc_prediction

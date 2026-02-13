@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 
 from pyspectral.core import EpochLoss
-from pyspectral.data.features import FoldStat
 from pyspectral.data.io import DataArtifacts, Presence
 from pyspectral.types import (
     Arr1DF,
@@ -118,6 +117,8 @@ class EpochLosses:
 
 
 class Preds:
+    """Basic storage class for predictions in OOF training."""
+
     def __init__(self, true_values: np.ndarray) -> None:
         self.epoch_loss: list[FoldLoss] = []
         self.pred: np.ndarray | None = None
@@ -154,55 +155,6 @@ class Preds:
         if idx is not None:
             return self.true[idx], self.pred[idx]
         return self.true, self.pred
-
-
-class Stats:
-    """Store per fold stats."""
-
-    def __init__(self, prc_spectra: ArrayF32 | ArrayF, artifacts: DataArtifacts):
-        # all shapes are the same: (N,C)
-        prc_spectra = prc_spectra.astype(np.float32, copy=False)
-        self.pred_std: ArrayF32 = np.zeros_like(prc_spectra)
-        self.true_std: ArrayF32 = np.zeros_like(prc_spectra)
-        self.diag_std: ArrayF32 = np.zeros_like(prc_spectra)
-        self.diag_orig: ArrayF32 = np.zeros_like(prc_spectra)
-
-        # to compute RMSE in original units we’ll store per-sample inverse later
-        self.pred_orig: ArrayF32 = np.zeros_like(prc_spectra)
-        self._prc: ArrayF32 = prc_spectra
-
-        # training & test loss stats
-        self.epoch_loss: list[FoldLoss] = []
-
-        self.artifacts: DataArtifacts = artifacts
-
-    def store(
-        self,
-        fold_stat: FoldStat,
-        best_preds_fold: list[ArrayF32] | None,
-        test_idx: IndexArray,
-        fold_epoch_loss: FoldLoss,
-    ) -> None:
-        """Update records of out of fold stats each fold."""
-        if best_preds_fold is None:
-            raise RuntimeError(
-                "best_preds_fold is None; did training produce any predictions?"
-            )
-        preds_fold = np.concatenate(best_preds_fold, axis=0)
-        self.pred_std[test_idx] = preds_fold
-        self.true_std[test_idx] = fold_stat.te_y_znorm.z
-        # inverse transform to original Y units: y = y_std*sd + mu
-        y_pred_orig = preds_fold * fold_stat.tr_y_znorm.std + fold_stat.tr_y_znorm.mean
-        self.pred_orig[test_idx] = y_pred_orig
-
-        self.epoch_loss.append(fold_epoch_loss)
-
-    def get_loss(self) -> EpochLosses:
-        return EpochLosses(_fold_loss=self.epoch_loss)
-
-    def get_pred(self) -> tuple[ArrayF32, ArrayF32]:
-        assert self.pred_orig is not None
-        return self._prc, self.pred_orig
 
 
 class ClassStats:

@@ -2,26 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Literal
 
 from loguru import logger
 import numpy as np
 import numpy.typing as npt
-from numpy.typing import DTypeLike
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 
 from pyspectral.config import REF_PHE
-from pyspectral.core import apply_z
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
-    ArrayF32,
-    MeanArray,
-    StdArray,
 )
 
 # -- general helpers -------------------------------------------------------
+
+type Dimensions = np.ndarray[tuple[int, int, int], np.dtype[np.float64]]
 
 
 def _filter_array(
@@ -39,116 +33,10 @@ def _area_under_curve(y: ArrayF, x: ArrayF) -> float:
     return float(np.trapezoid(y, x))
 
 
-# -- per fold details -------------------------------------------------------
-
-
-def fit_diag_affine(x_std: ArrayF32, y_std: ArrayF32) -> tuple[ArrayF, ArrayF]:
-    """
-    Fit per-band y ~ a*x + b on train (both x,y are z-scored per-band using training stats).
-    Args: x_std, y_std: (n_train, C)
-    Returns: a, b: (C,), (C,)
-    """
-    x_std_m = x_std.mean(axis=0)  # (C,)
-    y_std_m = y_std.mean(axis=0)  # (C,)
-    x_center = x_std - x_std_m  # (n,C)
-    y_center = y_std - y_std_m  # (n,C)
-    x2 = np.sum(x_center * x_center, axis=0)  # Var * n (C,)
-    xy = np.sum(x_center * y_center, axis=0)  # Cov * n (C,)
-    a = xy / np.clip(x2, 1e-12, None)  # (C,) slope per band
-    b = y_std_m - a * x_std_m  # (C,) intercept per band
-    return a, b
-
-
-def predict_diag_affine(x_std: ArrayF32, a: ArrayF, b: ArrayF) -> ArrayF:
-    """
-    Apply per-band yhat = a*x + b in standardized space.
-    Args: x_std: (n_test, C), a,b: (C,)
-    Returns: yhat_std: (n_test, C)
-    """
-    return (a * x_std) + b
-
-
-class NormalizedData:
-    """
-    Input Args:
-        array: shape (N, C)
-
-    Fields:
-        original: shape (N, C)
-        mean: shape (C,)
-        std: shape (C,)
-        z: shape (N, C), normalized original array
-
-
-    """
-
-    def __init__(
-        self,
-        array: np.ndarray,
-        *,
-        axis: int | None = None,
-        dtype: DTypeLike | None = None,
-        mean: MeanArray | None = None,
-        std: StdArray | None = None,
-    ):
-        """Optionally provide an overiding std and mean"""
-        self.original: np.ndarray = array
-        self.mean: MeanArray = (
-            MeanArray(array.mean(axis=axis, dtype=dtype)) if mean is None else mean
-        )
-        self.std: StdArray = (
-            StdArray(array.std(axis=axis, dtype=dtype) + 1e-8) if std is None else std
-        )  # prevent zero std
-        self.z: np.ndarray = apply_z(array, self.mean, self.std)
-
-    def get_stats(self) -> tuple[MeanArray, StdArray]:
-        return self.mean, self.std
-
-
-@dataclass(frozen=True, slots=True)
-class FoldStat:
-    tr_x_znorm: NormalizedData
-    tr_y_znorm: NormalizedData
-    te_x_znorm: NormalizedData
-    te_y_znorm: NormalizedData
-
-    def get_baseline(self) -> tuple[ArrayF, ArrayF]:
-        x_std = self.tr_x_znorm.z
-        # find the slope & intercept for linear relation between raw and correct z weights; shape: (C,), (C,)
-        a, b = fit_diag_affine(x_std, self.tr_y_znorm.z)
-        # using the train fit, predict the normalized result
-        yhat_test_std = predict_diag_affine(x_std, a, b)  # (n_test, C)
-        # inverse to original prediction units for reporting; shape: (n_test, C)
-        yhat_test_orig = (yhat_test_std * self.tr_y_znorm.std) + self.tr_y_znorm.mean
-        return yhat_test_std, yhat_test_orig
-
-    @classmethod
-    def from_subset(
-        cls,
-        raw_train_subset: np.ndarray,
-        prc_train_subset: np.ndarray,
-        raw_test_subset: np.ndarray,
-        prc_test_subset: np.ndarray,
-    ) -> FoldStat:
-        # Per-fold std deviation & mean (fit on train only)
-        tr_raw_z = NormalizedData(raw_train_subset, axis=0)
-        tr_prc_z = NormalizedData(prc_train_subset, axis=0)
-        raw_mean, raw_std = tr_raw_z.get_stats()
-        prc_mean, prc_std = tr_prc_z.get_stats()
-        te_raw_z = NormalizedData(raw_test_subset, mean=raw_mean, std=raw_std)
-        te_prc_z = NormalizedData(prc_test_subset, mean=prc_mean, std=prc_std)
-
-        return cls(
-            tr_x_znorm=tr_raw_z,
-            tr_y_znorm=tr_prc_z,
-            te_x_znorm=te_raw_z,
-            te_y_znorm=te_prc_z,
-        )
-
-
 # -- pixel to class -------------------------------------------------------
 
 
+# TODO: move to core?
 def convert_to_class(pres: float, *, maybe_value: float | None = 0.5) -> float | None:
     """Normalize a presence scalar to {0.0, 0.5, 1.0}.
 
@@ -175,34 +63,7 @@ def convert_arr_to_class(
     )
 
 
-def make_pca_features(
-    X_train: np.ndarray, X_test: np.ndarray, n_components: int = 10
-) -> tuple[np.ndarray, np.ndarray, PCA, StandardScaler]:
-    # standardize per-band
-    scaler = StandardScaler(with_mean=True, with_std=True)
-    X_train_sc = scaler.fit_transform(X_train)
-    X_test_sc = scaler.transform(X_test)
-
-    pca = PCA(n_components=n_components, svd_solver="full")
-    Z_train = pca.fit_transform(X_train_sc)
-    Z_test = pca.transform(X_test_sc)
-    return Z_train.astype("float32"), Z_test.astype("float32"), pca, scaler
-
-
 # -- per pixel details -------------------------------------------------------
-
-
-# TODO:
-def get_concentration(absorption: ArrayF, k: ArrayF) -> ArrayF:
-    # Regression, we can use least squares to measure concentration:
-    # minimizing function: S = \sum_i=1^n (y_i - f_i)^2
-    # => c = (K^T A) / (K^T K)
-    # with K being the absorbance coefficient & A the light absorption
-    # with variance of:
-    # σ^2 ≈ S/(N-1)
-    numerator = k.T @ absorption
-    denom = np.linalg.inv(k.T @ k)
-    return denom @ numerator
 
 
 @dataclass
@@ -221,7 +82,7 @@ class RegionSet:
 
     # float (0, 1): percent half-width
     # int (0 <= ): absolute half-width (cm^-1)
-    window_range: float | int = 250
+    window_range: float | int = 0.01
 
     def __post_init__(self) -> None:
         def hw(center: float) -> float:
@@ -256,24 +117,54 @@ class RegionSet:
         dist = [self.lo_distance, self.mid_distance, self.hi_distance]
         yield from zip(win, dist)
 
-    def get_low(self) -> tuple[float, float]:
-        return self.lo_window
 
-    def get_mid(self) -> tuple[float, float]:
-        return self.mid_window
+# TODO: name is too similar to the presence type used later on
+@dataclass(frozen=True, slots=True)
+class PresenceMap:
+    lo: np.float64
+    mid: np.float64
+    hi: np.float64
 
-    def get_high(self) -> tuple[float, float]:
-        return self.hi_window
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
+        arr = np.asarray([self.lo, self.mid, self.hi], dtype=dtype)
+        return arr.copy() if copy else arr
 
-    def match(self, sample: float) -> Literal["low", "middle", "high"] | None:
-        """Find if sample is found within expected features, if so, return which feature."""
-        if self.lo_window[0] <= sample and sample <= self.lo_window[1]:
-            return "low"
-        elif self.mid_window[0] <= sample and sample <= self.mid_window[1]:
-            return "middle"
-        elif self.hi_window[0] <= sample and sample <= self.hi_window[1]:
-            return "high"
-        return None
+    @classmethod
+    def from_ratios(cls, ratios: list[np.float64]) -> PresenceMap:
+        if (b := len(ratios)) > 3:
+            raise ValueError(f"Maps contain more bands than expected: {b}")
+        elif (b := len(ratios)) < 3:
+            raise ValueError(f"Maps contain less bands than expected: {b}")
+        else:
+            lo = ratios[0]
+            mid = ratios[1]
+            hi = ratios[2]
+            return PresenceMap(lo, mid, hi)
+
+
+@dataclass
+class SpectraBandFeatures:
+    """Spectral features around particular bands.
+
+    presence_map: PresenceMap, corresponding to the regions examined
+    dims: Dimensions, a 3x2 feature array for the sprectal bands
+    """
+
+    presence_map: PresenceMap
+    dims: Dimensions
+
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
+        if copy is False:
+            raise ValueError("`copy=False` isn't supported. A copy is always created.")
+
+        presence_map = np.asarray(self.presence_map, dtype=np.float64)
+        dims = np.asarray(self.dims, dtype=np.float64).ravel()
+
+        return np.concat([dims, presence_map], dtype=dtype)
 
 
 def _log_ratio_area(
@@ -333,54 +224,10 @@ def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF) -> tuple[float, float]:
     return peak, float(abs(xr - xl))
 
 
-@dataclass(frozen=True, slots=True)
-class PresenceMap:
-    lo: np.float64
-    mid: np.float64
-    hi: np.float64
-
-    def __array__(
-        self, dtype: np.dtype | None = None, copy: bool | None = None
-    ) -> np.ndarray:
-        arr = np.asarray([self.lo, self.mid, self.hi], dtype=dtype)
-        return arr.copy() if copy else arr
-
-    @classmethod
-    def from_ratios(cls, ratios: list[np.float64]) -> PresenceMap:
-        if (b := len(ratios)) > 3:
-            raise ValueError(f"Maps contain more bands than expected: {b}")
-        elif (b := len(ratios)) < 3:
-            raise ValueError(f"Maps contain less bands than expected: {b}")
-        else:
-            lo = ratios[0]
-            mid = ratios[1]
-            hi = ratios[2]
-            return PresenceMap(lo, mid, hi)
-
-
-type Dimensions = np.ndarray[tuple[int, int, int], np.dtype[np.float64]]
-
-
-@dataclass
-class SpectraBandFeatures:
-    presence_map: PresenceMap
-    dims: Dimensions
-
-    def __array__(
-        self, dtype: np.dtype | None = None, copy: bool | None = None
-    ) -> np.ndarray:
-        if copy is False:
-            raise ValueError("`copy=False` isn't supported. A copy is always created.")
-
-        presence_map = np.asarray(self.presence_map, dtype=np.float64)
-        dims = np.asarray(self.dims, dtype=np.float64).ravel()
-
-        return np.concat([dims, presence_map], dtype=dtype)
-
-
 def _disjoint_baseline_window(
     band_win: tuple[float, float], base_center: float, half_width: float
 ) -> tuple[float, float]:
+    """Shift the band window away from the baseline if overlapping."""
     lo, hi = base_center - half_width, base_center + half_width
     # shift baseline window away if overlapping
     if not (hi <= band_win[0] or lo >= band_win[1]):
@@ -390,21 +237,21 @@ def _disjoint_baseline_window(
     return lo, hi
 
 
-# -- helper to build spectral band features ------------------------------------------------------
-
-
 def create_specband_feats(
     spectra: Arr1DF,
     wl: Arr1DF,
     regions: RegionSet,
     baseline_point: float = REF_PHE,
 ) -> SpectraBandFeatures:
+    """Helper to build spectral band features."""
     dims_list: list[tuple[float, float]] = []
     ratios: list[np.float64] = []
 
-    for band_win, dist in regions:
-        roi, wl_roi = _filter_array(spectra, wl, band_win[0], band_win[1])
-        base_lo, base_hi = _disjoint_baseline_window(band_win, baseline_point, dist / 2)
+    for (lo_band_win, hi_band_win), dist in regions:
+        roi, wl_roi = _filter_array(spectra, wl, lo_band_win, hi_band_win)
+        base_lo, base_hi = _disjoint_baseline_window(
+            (lo_band_win, hi_band_win), baseline_point, dist / 2
+        )
         baseline, wl_base = _filter_array(spectra, wl, base_lo, base_hi)
 
         region_ratio = _log_ratio_area(roi, baseline, wl_roi, wl_base)

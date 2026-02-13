@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from pyspectral.config import DATA_DIR, PROCESSED_DATA_DIR, RAW_DATA_DIR
 import pyspectral.data.io as pdi
@@ -43,30 +42,3 @@ def test_loading_hsi_map():
     assert xy.shape == xy_gt.shape == (64, 2)
     assert spectra.shape == spectra_gt.shape == (64, M)
     assert cube.shape == cube_gt.shape == (8, 8, M)
-
-
-def test_spectral_pair():
-    from sklearn.model_selection import KFold
-
-    import pyspectral.result.spec_spec_trad as predict
-
-    pair = pdi.SpectraPair(
-        spectra.get().astype(np.float64), spectra_gt.get().astype(np.float64)
-    )
-    _ncomp = max(2, min(pair.X_raw.shape[0] // 2, 32))
-    cv = KFold(n_splits=5, shuffle=True, random_state=42)
-    pred = predict.pcr_predict(pair.X_raw, pair.Y_proc, cv)
-
-    assert isinstance(pred, np.ndarray)
-
-
-@pytest.mark.slow
-def test_oof_stats():
-    from pyspectral.modeling.oof import Stats
-
-    rows = pdi.read_pairs(csv_path, DATA_DIR)
-    pair, arts = pdi.SpectraPair.from_annotations(rows)
-    _raw = pair.X_raw.astype(np.float32)  # (N,C)
-    prc = pair.Y_proc.astype(np.float32)  # (N,C)
-    oof_stats = Stats(prc, arts)
-    assert isinstance(oof_stats, Stats)

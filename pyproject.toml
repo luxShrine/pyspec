@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "pyspectral"
-version = "0.1.0"
+version = "0.2.0"
 description = "Machine learning for processing spectral imaging"
 license = { file = "LICENSE" }
 readme = "README.md"
@@ -108,7 +108,7 @@ disallow_untyped_defs = true
 warn_unreachable = true
 
 [tool.basedpyright]
-include = ["pyspectal"]
+include = ["pyspectral"]
 stubPath = "stubs/"
 defineConstant = { DEBUG = true }
 pythonVersion = "3.13"
