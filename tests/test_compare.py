@@ -4,8 +4,12 @@ from sklearn.metrics import confusion_matrix
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from pyspectral.result.compare import _ensure_pipeline_feature_compatibility
+from pyspectral.result.compare import (
+    _check_prediction_polarity,
+    _ensure_pipeline_feature_compatibility,
+)
 from pyspectral.result.predict import MaskedValues
+from pyspectral.types import UnitFloat
 
 
 def test_positive_negative_mask_thresholds_predictions() -> None:
@@ -50,3 +54,42 @@ def test_ensure_pipeline_feature_compatibility_resamples_with_wavelengths() -> N
     assert aligned.shape == (2, 5)
     assert np.allclose(aligned[0], np.array([0.0, 0.5, 1.0, 1.5, 2.0]))
     assert np.allclose(aligned[1], np.array([2.0, 2.5, 3.0, 3.5, 4.0]))
+
+
+@pytest.mark.unit
+def test_check_prediction_polarity_passes_for_non_inverted_probs() -> None:
+    true = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    pred_prob = np.array([0.9, 0.8, 0.2, 0.1], dtype=np.float32)
+
+    flipped = _check_prediction_polarity(
+        "unit-noninverted", true, pred_prob, UnitFloat(0.5)
+    )
+
+    assert flipped is False
+
+
+@pytest.mark.unit
+def test_check_prediction_polarity_flags_inverted_probs() -> None:
+    true = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    pred_prob = np.array([0.1, 0.2, 0.8, 0.9], dtype=np.float32)
+
+    flipped = _check_prediction_polarity(
+        "unit-inverted", true, pred_prob, UnitFloat(0.5)
+    )
+
+    assert flipped is True
+
+
+@pytest.mark.unit
+def test_check_prediction_polarity_strict_raises_for_inversion() -> None:
+    true = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    pred_prob = np.array([0.1, 0.2, 0.8, 0.9], dtype=np.float32)
+
+    with pytest.raises(RuntimeError):
+        _check_prediction_polarity(
+            "unit-inverted",
+            true,
+            pred_prob,
+            UnitFloat(0.5),
+            strict=True,
+        )

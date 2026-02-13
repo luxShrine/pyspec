@@ -1,36 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-from sklearn.decomposition import PCA
-from sklearn.linear_model import MultiTaskElasticNetCV, RidgeCV
-from sklearn.metrics import root_mean_squared_error
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-import sklearn.svm as svm
-import torch
-from tqdm.auto import tqdm
 
-from pyspectral.core import Cube, FlatMap, TruePredPair
-from pyspectral.data.dataset import CrossValidator, KFolds
-from pyspectral.data.features import (
-    FoldStat,
-    RegionSet,
-    create_specband_feats,
-    fit_diag_affine,
-    predict_diag_affine,
-)
-from pyspectral.data.io import HSIMap, Presence, read_pairs
-from pyspectral.data.preprocessing import find_peak_in_window, preprocess_cube
-from pyspectral.modeling.models import MILMeanHead
+from pyspectral.core import Cube
+from pyspectral.data.io import read_pairs
+from pyspectral.data.preprocessing import find_peak_in_window
 from pyspectral.modeling.oof import Stats
-from pyspectral.modeling.train import compute_iou_from_masks, pred_to_numpy
-from pyspectral.result.predict import PredCompare
-from pyspectral.types import Arr1DF, Arr2DF32, ArrayF, ArrayF32, UnitFloat
+from pyspectral.types import ArrayF
 
 # -- Spec to Spec ML predict -------------------------------------------------------
 

@@ -16,7 +16,6 @@ from pyspectral.types import (
     Arr1DF,
     Arr2DF,
     ArrayF,
-    ArrayF32,
     BaselinePolynomialDegree,
     SpectralMode,
 )
