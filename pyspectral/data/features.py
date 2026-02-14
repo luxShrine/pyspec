@@ -19,12 +19,15 @@ type Dimensions = np.ndarray[tuple[int, int, int], np.dtype[np.float64]]
 
 
 def _filter_array(
-    array: ArrayF, wl: ArrayF, lower_bound: float, upper_bound: float
+    to_filter_array: ArrayF, basis_array: ArrayF, lower_bound: float, upper_bound: float
 ) -> tuple[ArrayF, ArrayF]:
-    mask = (wl >= lower_bound) & (wl <= upper_bound)
+    """Filter an array based on the values of the basis array."""
+    mask = (basis_array >= lower_bound) & (basis_array <= upper_bound)
     if not np.any(mask):
-        return np.empty(0, dtype=array.dtype), np.empty(0, dtype=array.dtype)
-    return array[..., mask], wl[mask]
+        return np.empty(0, dtype=to_filter_array.dtype), np.empty(
+            0, dtype=to_filter_array.dtype
+        )
+    return to_filter_array[..., mask], basis_array[mask]
 
 
 def _area_under_curve(y: ArrayF, x: ArrayF) -> float:
@@ -112,15 +115,34 @@ class RegionSet:
         self.mid_distance = 2 * r2
         self.hi_distance = 2 * r3
 
+    def get_window(self, center: float) -> float:
+        """Potentially convert window range to distance from relative precentage."""
+        win_range = float(self.window_range)
+        win_range_is_percent = 0.0 < win_range <= 1.0
+        return (win_range * center) if win_range_is_percent else win_range
+
     def __iter__(self) -> Iterator[tuple[tuple[float, float], float]]:
         win = [self.lo_window, self.mid_window, self.hi_window]
         dist = [self.lo_distance, self.mid_distance, self.hi_distance]
         yield from zip(win, dist)
 
+    def get_dims(
+        self, spectra: ArrayF, wl: ArrayF
+    ) -> tuple[Dimensions, list[tuple[ArrayF, ArrayF]]]:
+        """Returns a (3,2) dimension indicating feature, along with the ROI filtered arrays."""
+        # filters each region, for the intensities and wl
+        roi_filtered_arr = list(
+            map(lambda filt: _filter_array(spectra, wl, filt[0][0], filt[0][1]), self)
+        )
+        dims_list: list[tuple[float, float]] = [
+            _get_dim_in_region(roi, wl_roi) for (roi, wl_roi) in roi_filtered_arr
+        ]
+        dims: Dimensions = np.asarray(dims_list)
+        return (dims, roi_filtered_arr)
 
-# TODO: name is too similar to the presence type used later on
+
 @dataclass(frozen=True, slots=True)
-class PresenceMap:
+class PresenceWindows:
     lo: np.float64
     mid: np.float64
     hi: np.float64
@@ -132,7 +154,7 @@ class PresenceMap:
         return arr.copy() if copy else arr
 
     @classmethod
-    def from_ratios(cls, ratios: list[np.float64]) -> PresenceMap:
+    def from_ratios(cls, ratios: list[np.float64]) -> PresenceWindows:
         if (b := len(ratios)) > 3:
             raise ValueError(f"Maps contain more bands than expected: {b}")
         elif (b := len(ratios)) < 3:
@@ -141,18 +163,45 @@ class PresenceMap:
             lo = ratios[0]
             mid = ratios[1]
             hi = ratios[2]
-            return PresenceMap(lo, mid, hi)
+            return cls(lo, mid, hi)
+
+
+@dataclass(frozen=True, slots=True)
+class FullPresenceWindows:
+    """Alternative to the PresenceWindows, this contains the full spectra contained in the windows."""
+
+    lo: ArrayF
+    mid: ArrayF
+    hi: ArrayF
+
+    def __array__(
+        self, dtype: np.dtype | None = None, copy: bool | None = None
+    ) -> np.ndarray:
+        arr = np.concat([self.lo, self.mid, self.hi], dtype=dtype)
+        return arr.copy() if copy else arr
+
+    @classmethod
+    def from_regions(cls, arrays: list[ArrayF]) -> FullPresenceWindows:
+        if (b := len(arrays)) > 3:
+            raise ValueError(f"Maps contain more bands than expected: {b}")
+        elif (b := len(arrays)) < 3:
+            raise ValueError(f"Maps contain less bands than expected: {b}")
+        else:
+            lo = arrays[0]
+            mid = arrays[1]
+            hi = arrays[2]
+            return cls(lo, mid, hi)
 
 
 @dataclass
 class SpectraBandFeatures:
     """Spectral features around particular bands.
 
-    presence_map: PresenceMap, corresponding to the regions examined
+    presence_map: (Full)PresenceWindows corresponding to the intensity spectrum or ratios of regions examined
     dims: Dimensions, a 3x2 feature array for the sprectal bands
     """
 
-    presence_map: PresenceMap
+    presence_map: FullPresenceWindows | PresenceWindows
     dims: Dimensions
 
     def __array__(
@@ -173,17 +222,17 @@ def _log_ratio_area(
     wl_roi: ArrayF,
     wl_base: ArrayF,
 ) -> float:
-    ar = _area_under_curve(roi, wl_roi)
-    ab = _area_under_curve(baseline_region, wl_base)
+    roi_area = _area_under_curve(roi, wl_roi)
+    base_area = _area_under_curve(baseline_region, wl_base)
 
     # if we cant compute area, treat it as no contrast, zero
-    if not np.isfinite(ar) or not np.isfinite(ab):
+    if not np.isfinite(roi_area) or not np.isfinite(base_area):
         return 0.0
 
     # prevent negative with small min
     min = np.median(roi) * 0.05
-    roi_area = max(ar, min)
-    base_area = max(ab, min)
+    roi_area = max(roi_area, min)
+    base_area = max(base_area, min)
 
     # clip ratio if above/below certain extremes
     raw_ratio = base_area / roi_area
@@ -215,11 +264,15 @@ def _get_dim_in_region(roi: ArrayF, wl_roi: ArrayF) -> tuple[float, float]:
 
     li = int(left[-1])
     li2 = min(li + 1, i)
-    xl = float(np.interp(half, [roi[li], roi[li2]], [wl_roi[li], wl_roi[li2]]))
+    xpl = [roi[li], roi[li2]]  # using the intensity mappings as the x values
+    fpl = [wl_roi[li], wl_roi[li2]]  # interpreting wls as they are the desired y values
+    xl = float(np.interp(half, xpl, fpl))
 
     ri = int(i + right[0])
     ri1 = max(ri - 1, i)
-    xr = float(np.interp(half, [roi[ri1], roi[ri]], [wl_roi[ri1], wl_roi[ri]]))
+    xpr = [roi[ri1], roi[ri]]
+    fpr = [wl_roi[ri1], wl_roi[ri]]
+    xr = float(np.interp(half, xpr, fpr))
 
     return peak, float(abs(xr - xl))
 
@@ -242,24 +295,30 @@ def create_specband_feats(
     wl: Arr1DF,
     regions: RegionSet,
     baseline_point: float = REF_PHE,
+    window_full: bool = False,
 ) -> SpectraBandFeatures:
     """Helper to build spectral band features."""
-    dims_list: list[tuple[float, float]] = []
-    ratios: list[np.float64] = []
 
-    for (lo_band_win, hi_band_win), dist in regions:
-        roi, wl_roi = _filter_array(spectra, wl, lo_band_win, hi_band_win)
-        base_lo, base_hi = _disjoint_baseline_window(
-            (lo_band_win, hi_band_win), baseline_point, dist / 2
-        )
-        baseline, wl_base = _filter_array(spectra, wl, base_lo, base_hi)
+    (dims, roi_list) = regions.get_dims(spectra, wl)
 
-        region_ratio = _log_ratio_area(roi, baseline, wl_roi, wl_base)
-        ratios.append(np.float64(region_ratio))
+    secondary_feature: FullPresenceWindows | PresenceWindows
+    if window_full:
+        # use full window
+        roi_arr = [roi_intensity for (roi_intensity, _) in roi_list]
+        secondary_feature = FullPresenceWindows.from_regions(roi_arr)
+    else:
+        # use ratios
+        ratios: list[np.float64] = []
+        for i, ((lo_band_win, hi_band_win), dist) in enumerate(regions):
+            intensity_roi, wl_roi = roi_list[i][0], roi_list[i][1]
+            base_lo, base_hi = _disjoint_baseline_window(
+                (lo_band_win, hi_band_win), baseline_point, dist / 2
+            )
+            intensity_base, wl_base = _filter_array(spectra, wl, base_lo, base_hi)
+            region_ratio = _log_ratio_area(
+                intensity_roi, intensity_base, wl_roi, wl_base
+            )
+            ratios.append(np.float64(region_ratio))
+        secondary_feature = PresenceWindows.from_ratios(ratios)
 
-        h, w = _get_dim_in_region(roi, wl_roi)
-        dims_list.append((h, w))
-
-    presence_map = PresenceMap.from_ratios(ratios)
-    dims: Dimensions = np.asarray(dims_list, dtype=np.float64)  # (3,2)
-    return SpectraBandFeatures(presence_map, dims)
+    return SpectraBandFeatures(secondary_feature, dims)
