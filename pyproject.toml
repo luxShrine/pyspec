@@ -14,7 +14,6 @@ classifiers = [
 ]
 dependencies = [
     "beartype>=0.22.5",
-    "ipympl>=0.9.8",
     "jaxtyping>=0.3.3",
     "loguru",
     "marimo>=0.19.10",
@@ -41,7 +40,6 @@ requires-python = "~=3.13.0"
 dev = [
     "pytest",
     "ruff",
-    "ipykernel>=6.30.1",
     "mypy>=1.18.2",
 ]
 
