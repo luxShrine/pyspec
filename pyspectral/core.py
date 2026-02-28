@@ -1,3 +1,5 @@
+"""Shared utilities, and base classes that inhabit most spectral functionalities"""
+
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -17,6 +19,11 @@ from pyspectral.types import (
     MeanArray,
     StdArray,
 )
+
+
+def absolute_diff(a: float, b: float) -> float:
+    """Compute the percent difference between two quantities."""
+    return (abs(a - b) / ((a + b) / 2)) * 100
 
 
 def apply_z(y: np.ndarray, mean: MeanArray, std: StdArray) -> np.ndarray:

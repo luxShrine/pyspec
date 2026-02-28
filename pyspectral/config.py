@@ -25,6 +25,10 @@ FIGURES_DIR: Path = REPORTS_DIR / "figures"
 
 RNG = np.random.default_rng(42)
 REF_PHE = 1003.0
+ALGINATE_LOW_SPEC_FEATURE = 900
+ALGINATE_MID_SPEC_FEATURE = 1400
+ALGINATE_UPPER_SPEC_FEATURE = 1700
+
 
 # with tqdm installed, configure loguru with tqdm.write
 # https://github.com/Delgan/loguru/issues/135

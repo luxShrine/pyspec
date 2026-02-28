@@ -15,9 +15,9 @@ import sklearn.svm as svm
 
 from pyspectral.config import READY_DATA_DIR
 from pyspectral.core import FlatMap
-from pyspectral.data.dataset import KFolds
 import pyspectral.data.io as io
 import pyspectral.data.preprocessing as prep
+from pyspectral.data.shared import KFolds
 import pyspectral.modeling.oof as oof
 from pyspectral.modeling.train import (
     compute_iou_from_masks,

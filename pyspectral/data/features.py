@@ -7,13 +7,19 @@ from loguru import logger
 import numpy as np
 import numpy.typing as npt
 
-from pyspectral.config import REF_PHE
+from pyspectral.config import (
+    ALGINATE_LOW_SPEC_FEATURE,
+    ALGINATE_MID_SPEC_FEATURE,
+    ALGINATE_UPPER_SPEC_FEATURE,
+    REF_PHE,
+)
 from pyspectral.types import (
     Arr1DF,
     ArrayF,
 )
 
 # -- general helpers -------------------------------------------------------
+
 
 type Dimensions = np.ndarray[tuple[int, int, int], np.dtype[np.float64]]
 
@@ -66,6 +72,24 @@ def convert_arr_to_class(
     )
 
 
+def get_proper_bounds(
+    center: float,
+    abs_range: float,
+    *,
+    lower_bound: float = 1e-7,
+    upper_bound: float | None = None,
+) -> tuple[float, float]:
+    """Create a region that is positive and optionally bounded."""
+    lhs_bound = max(center - abs_range, lower_bound)
+    rhs_bound = abs_range + center
+    if abs(lhs_bound - rhs_bound) < 1e-9:
+        # prevent the two bounds from being too close
+        rhs_bound *= 1.005
+    if upper_bound is not None:
+        rhs_bound = max(rhs_bound, upper_bound)
+    return (lhs_bound, rhs_bound)
+
+
 # -- per pixel details -------------------------------------------------------
 
 
@@ -73,9 +97,9 @@ def convert_arr_to_class(
 class RegionSet:
     """Characteristic spectral features in 800–1000 cm⁻¹, 1300–1500 cm⁻¹, and 1500–1800 cm⁻¹"""
 
-    low: float = 900.0
-    mid: float = 1400.0
-    high: float = 1650.0
+    low: float = ALGINATE_LOW_SPEC_FEATURE
+    mid: float = ALGINATE_MID_SPEC_FEATURE
+    high: float = ALGINATE_UPPER_SPEC_FEATURE
     lo_window: tuple[float, float] = field(init=False)
     mid_window: tuple[float, float] = field(init=False)
     hi_window: tuple[float, float] = field(init=False)
@@ -86,31 +110,53 @@ class RegionSet:
     # float (0, 1): percent half-width
     # int (0 <= ): absolute half-width (cm^-1)
     window_range: float | int = 0.01
+    allowed_overlap: float = 0.05
 
     def __post_init__(self) -> None:
-        def hw(center: float) -> float:
-            win_range = float(self.window_range)
-            return win_range * center if 0.0 < win_range <= 1.0 else win_range
+        r1 = self.get_window(self.low)
+        r2 = self.get_window(self.mid)
+        r3 = self.get_window(self.high)
 
-        r1 = hw(self.low)
-        r2 = hw(self.mid)
-        r3 = hw(self.high)
-        # prevent negative region, could also add high boundaries
-        self.lo_window = (max(self.low - r1, 0), self.low + r1)
-        self.mid_window = (max(self.mid - r2, 0), self.mid + r2)
-        self.hi_window = (max(self.high - r3, 0), self.high + r3)
-        # adjust if overlap greater than 0.1
-        while (0.9 * self.lo_window[1]) > self.mid_window[0]:
-            r1 = r1 * 0.9
-            r2 = r2 * 0.9
-            self.lo_window = (max(self.low - r1, 0), self.low + r1)
-            self.mid_window = (max(self.mid - r2, 0), self.mid + r2)
-        while (0.9 * self.mid_window[1]) > self.hi_window[0]:
-            r2 = r2 * 0.9
-            r3 = r3 * 0.9
-            self.mid_window = (max(self.mid - r2, 0), self.mid + r2)
-            self.hi_window = (max(self.high - r3, 0), self.high + r3)
+        # adjust if windows overlap greater than some % amount
+        # for loop prevents infinite optimization
+        for i in range(10, 100):
+            self.lo_window = get_proper_bounds(self.low, r1)
+            self.mid_window = get_proper_bounds(self.mid, r2)
+            # check if upper region dips into lower region
+            low_mid_overlap_diff = self.lo_window[1] - self.mid_window[0]
+            # total *unshared* area ensures that overlap does not dwarf the total area
+            # of either region
+            total_unshared_area = r1 + r2 - low_mid_overlap_diff
+            low_mid_overlap = low_mid_overlap_diff / total_unshared_area
+            if low_mid_overlap < self.allowed_overlap:
+                # overlap eliminated or didn't exist
+                break
+            if i % 10 == 0:
+                logger.debug(
+                    f"Low and middle windows overlap by: {low_mid_overlap}, {low_mid_overlap_diff}"
+                )
+            # shrink each region's range by %
+            reduce = i * 0.001
+            r1 *= reduce
+            r2 *= reduce
 
+        for i in range(10, 100):
+            self.mid_window = get_proper_bounds(self.mid, r2)
+            self.hi_window = get_proper_bounds(self.high, r3)
+            mid_hi_overlap_diff = self.mid_window[1] - self.hi_window[0]
+            total_unshared_area = r2 + r3 - mid_hi_overlap_diff
+            mid_hi_overlap = mid_hi_overlap_diff / total_unshared_area
+            if mid_hi_overlap < self.allowed_overlap:
+                break
+            if i % 10 == 0:
+                logger.debug(
+                    f"Middle and high windows overlap by: {mid_hi_overlap}, {mid_hi_overlap_diff}"
+                )
+            reduce = i * 0.01
+            r2 *= reduce
+            r3 *= reduce
+
+        # multipy by two, to better represent the region
         self.lo_distance = 2 * r1
         self.mid_distance = 2 * r2
         self.hi_distance = 2 * r3
